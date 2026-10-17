@@ -103,7 +103,8 @@ def init_schema():
         END;
 
         CREATE TABLE IF NOT EXISTS media_files (
-            md5 TEXT PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            md5 TEXT NOT NULL,
             kind TEXT NOT NULL,
             file_name TEXT,
             file_size INTEGER,
@@ -111,9 +112,12 @@ def init_schema():
             chat_hash TEXT,
             month TEXT,
             rel_path TEXT,
-            abs_path TEXT
+            abs_path TEXT,
+            -- 同一 md5 可能出现在多个会话目录下，主键只取 md5 会互相覆盖丢路径
+            UNIQUE(md5, rel_path)
         );
 
+        CREATE INDEX IF NOT EXISTS idx_media_md5 ON media_files(md5);
         CREATE INDEX IF NOT EXISTS idx_media_kind ON media_files(kind);
         CREATE INDEX IF NOT EXISTS idx_media_month ON media_files(month);
 
@@ -145,7 +149,28 @@ def init_schema():
 
 # ETL 解析/中间库结构版本号。解析逻辑或表结构变化时必须递增，
 # 否则老用户升级后源库文件未变 -> 指纹一致 -> 直接 skipped，新逻辑永不生效。
-ETL_SCHEMA_VERSION = "4"
+ETL_SCHEMA_VERSION = "5"
+
+# 派生表（media_files / favorites / emoticons）结构版本。这三张表每次 ETL 都会
+# 从源库整体重建，因此结构升级时直接 DROP 重建最安全，不会丢用户数据。
+DERIVED_SCHEMA_VERSION = "1"
+
+
+def _migrate_derived_tables(conn) -> None:
+    """派生表结构升级：DROP 后由随后的 ETL 重建"""
+    cur = conn.cursor()
+    cur.execute("SELECT value FROM meta WHERE key='derived_schema'")
+    row = cur.fetchone()
+    if row and row[0] == DERIVED_SCHEMA_VERSION:
+        return
+    for table in ("media_files", "favorites", "emoticons"):
+        cur.execute(f"DROP TABLE IF EXISTS {table}")
+    conn.commit()
+    init_schema()
+    cur.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('derived_schema', ?)",
+                (DERIVED_SCHEMA_VERSION,))
+    conn.commit()
+    logger.info(f"派生表结构已升级到 {DERIVED_SCHEMA_VERSION}，等待本次 ETL 重建")
 
 
 def compute_fingerprint(decrypted_dir: Path) -> str:
@@ -186,6 +211,7 @@ def sync_data(force: bool = False) -> dict:
 
     init_schema()
     conn = get_connection()
+    _migrate_derived_tables(conn)
     cur = conn.cursor()
 
     fp = compute_fingerprint(decrypted_dir)
@@ -212,16 +238,29 @@ def sync_data(force: bool = False) -> dict:
                 logger.warning(f"Sync {name} failed: {exc}")
 
     # 更新会话统计与 FTS 索引
+    # 顺带补齐会话的首条消息时间：v3/v4 的会话表都不提供该字段，
+    # 此前 sessions.first_time 恒为 NULL（写了但从不填）
     cur.execute("""
-        UPDATE sessions SET message_count = (
-            SELECT count(*) FROM messages WHERE messages.session_username = sessions.username
-        )
+        UPDATE sessions SET
+            message_count = (
+                SELECT count(*) FROM messages WHERE messages.session_username = sessions.username
+            ),
+            first_time = (
+                SELECT min(create_time) FROM messages WHERE messages.session_username = sessions.username
+            )
     """)
 
     # 重建 FTS 索引：历史版本用 INSERT OR REPLACE 写入，旧词条会残留
-    # （recursive_triggers 默认关闭，AFTER DELETE 触发器不触发），此处一次性自愈。
+    # （recursive_triggers 默认关闭，AFTER DELETE 触发器不触发）。
+    # 现在 UPSERT + messages_au 触发器已能增量保持一致，故只在 ETL 版本变化后
+    # 做一次全量 rebuild 自愈，避免每次 ETL 都白跑一遍 25 万行。
     try:
-        cur.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
+        cur.execute("SELECT value FROM meta WHERE key='fts_rebuilt_version'")
+        fts_row = cur.fetchone()
+        if not fts_row or fts_row[0] != ETL_SCHEMA_VERSION:
+            cur.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
+            cur.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('fts_rebuilt_version', ?)",
+                        (ETL_SCHEMA_VERSION,))
     except sqlite3.Error as exc:
         warnings.append(f"fts rebuild: {exc}")
         logger.warning(f"FTS rebuild failed: {exc}")

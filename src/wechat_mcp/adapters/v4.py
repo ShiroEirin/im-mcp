@@ -17,7 +17,7 @@ import sqlite3
 import hashlib
 import logging
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict
 
 from ..parser import build_content
 
@@ -57,6 +57,9 @@ def sync_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
                     rows = c_conn.execute(f"SELECT username, alias, remark, nick_name, {type_col} AS local_type FROM contact").fetchall()
                     for r in rows:
                         uname = r["username"]
+                        if not uname:
+                            # username 是 contacts 主键，NULL 会绕过 UNIQUE 去重并逐次累积
+                            continue
                         disp = r["remark"] or r["nick_name"] or r["alias"] or uname
                         cur.execute("""
                             INSERT OR REPLACE INTO contacts (username, alias, display_name, type)
@@ -106,15 +109,18 @@ def sync_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
                 cols = [r[1] for r in s_conn.execute("PRAGMA table_info(SessionTable)").fetchall()]
                 time_col = "last_timestamp" if "last_timestamp" in cols else ("last_time" if "last_time" in cols else "0")
                 
+                # 预载联系人昵称，避免逐会话回查（原实现是 N+1 查询）
+                name_by_user = {
+                    row[0]: row[1]
+                    for row in cur.execute("SELECT username, display_name FROM contacts")
+                    if row[0]
+                }
                 for r in s_conn.execute(f"SELECT username, summary, {time_col} AS last_time FROM SessionTable"):
                     uname = r["username"]
                     if not uname:
                         continue
                     stype = "room" if "@chatroom" in uname or "@openim" in uname else ("gh" if uname.startswith("gh_") else "c2c")
-                    # 匹配联系人中的昵称
-                    cur.execute("SELECT display_name FROM contacts WHERE username = ?", (uname,))
-                    c_row = cur.fetchone()
-                    dname = c_row[0] if c_row else uname
+                    dname = name_by_user.get(uname) or uname
 
                     cur.execute("""
                         INSERT OR REPLACE INTO sessions (username, type, display_name, last_time, last_msg_preview)
@@ -139,6 +145,14 @@ def sync_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
                 m_conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
                 m_conn.row_factory = sqlite3.Row
 
+                # 先看这个库到底有没有消息表；没有就直接跳过（media_0.db /
+                # message_fts.db / message_resource.db 等都不含 Msg_ 表）
+                # 用 GLOB 而非 LIKE：LIKE 的 '_' 是单字符通配符，会误匹配 MsgX… 等无关表
+                tables = [r[0] for r in m_conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name GLOB 'Msg_*'")]
+                if not tables:
+                    m_conn.close()
+                    continue
+
                 # 建立 Name2Id 映射与 MD5 反向字典
                 name2id: Dict[int, str] = {}
                 hash_to_user: Dict[str, str] = {}
@@ -148,12 +162,13 @@ def sync_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
                             name2id[rowid] = uname
                             h = hashlib.md5(uname.encode("utf-8")).hexdigest()
                             hash_to_user[h] = uname
-                except Exception:
-                    pass
-
-                # 遍历所有 Msg_<hash> 表
-                # 用 GLOB 而非 LIKE：LIKE 的 '_' 是单字符通配符，会误匹配 MsgX… 等无关表
-                tables = [r[0] for r in m_conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name GLOB 'Msg_*'")]
+                except sqlite3.Error as exc:
+                    # Name2Id 读失败会让会话键从「真实用户名」退化成「chat_<表哈希>」，
+                    # 与上一次成功的 ETL 不一致，同一条消息会以两个键各存一份。
+                    # 直接跳过该库等下次 ETL 重试，避免写入不稳定的键。
+                    logger.warning(f"{db_file.name}: Name2Id 读取失败，跳过该库以免写入不一致的会话键: {exc}")
+                    m_conn.close()
+                    continue
 
                 for tbl in tables:
                     tbl_hash = tbl[4:].strip().lower()  # 去掉 'Msg_' 前缀

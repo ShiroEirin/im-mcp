@@ -79,7 +79,7 @@ wechat-init
 3. `get_session_history(session_id="...", limit=100)`: 获取目标会话的上下文消息流。
 4. `search_shared_files(keyword="...", limit=20)`: 定位群内或私聊传输的文件路径。
 
-微信侧另提供：`get_messages_by_date` / `get_messages_by_range`（按日期或时间范围取数）、`search_contacts`（联系人反查）、`list_chatroom_members`（群成员名单）、`search_media_files`（图片/视频磁盘路径）、`list_favorites`（收藏）、`list_emoticons`（表情）、`get_chat_activity_stats`（活跃度统计）、`get_persona_style`（沟通风格蒸馏）、`get_sync_status`（索引新鲜度）。
+微信侧另提供：`get_messages_by_date` / `get_messages_by_range`（按日期或时间范围取数）、`search_contacts`（联系人反查）、`list_chatroom_members`（群成员名单）、`search_media_files`（图片/视频磁盘路径）、`list_favorites`（收藏）、`list_emoticons`（表情）、`get_chat_activity_stats`（活跃度统计）、`get_persona_style`（沟通风格蒸馏）、`get_sync_status`（索引新鲜度）。其中 `get_messages_by_date` / `get_messages_by_range` 与 `search_wechat_messages` 一样支持 `offset` 翻页。
 
 #### 钉钉 (dingtalk) 推荐调用顺序：
 1. `list_dingtalk_conversations(limit=20)`: 获取最近群聊与私聊列表（已自动映射最新实名及群名）。

@@ -10,10 +10,29 @@
 """
 
 import sqlite3
+import re
 import logging
 from pathlib import Path
 
+from ..parser import build_content
+
 logger = logging.getLogger(__name__)
+
+
+def _extract_v3_group_sender(bytes_extra) -> str:
+    """3.x 群聊的发言人不单独成列，而是编码在 BytesExtra 二进制里。
+
+    尽力提取 wxid_/gh_ 形式的标识；提取不到就返回空串，由调用方回退为会话 ID
+    （即修复前的行为），因此不会比现状更差。
+    """
+    if not bytes_extra:
+        return ""
+    if isinstance(bytes_extra, str):
+        bytes_extra = bytes_extra.encode("utf-8", errors="ignore")
+    if not isinstance(bytes_extra, (bytes, bytearray)):
+        return ""
+    match = re.search(rb"(wxid_[A-Za-z0-9_\-]{3,}|gh_[A-Za-z0-9_\-]{3,})", bytes(bytes_extra))
+    return match.group(1).decode("ascii", errors="ignore") if match else ""
 
 
 def is_v3_layout(decrypted_dir: Path) -> bool:
@@ -64,14 +83,18 @@ def sync_v3(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
                 cols = [r[1] for r in c_conn.execute("PRAGMA table_info(Session)").fetchall()]
                 time_col = "CreateTime" if "CreateTime" in cols else "0"
                 content_col = "Content" if "Content" in cols else "''"
+                # 预载联系人昵称，避免逐会话回查（N+1）
+                name_by_user = {
+                    row[0]: row[1]
+                    for row in cur.execute("SELECT username, display_name FROM contacts")
+                    if row[0]
+                }
                 for r in c_conn.execute(f"SELECT strUsrName, {time_col} AS last_time, {content_col} AS summary FROM Session"):
                     uname = r["strUsrName"]
                     if not uname:
                         continue
                     stype = "room" if "@chatroom" in uname or "@openim" in uname else ("gh" if uname.startswith("gh_") else "c2c")
-                    cur.execute("SELECT display_name FROM contacts WHERE username = ?", (uname,))
-                    c_row = cur.fetchone()
-                    dname = c_row[0] if c_row else uname
+                    dname = name_by_user.get(uname) or uname
 
                     cur.execute("""
                         INSERT OR REPLACE INTO sessions (username, type, display_name, last_time, last_msg_preview)
@@ -83,7 +106,10 @@ def sync_v3(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
             logger.warning(f"Error parsing 3.x MicroMsg.db {db_file}: {e}")
 
     # 查找 MSG*.db
-    msg_db_files = sorted(set(list(decrypted_dir.rglob("MSG*.db")) + list(decrypted_dir.rglob("ChatMsg.db"))))
+    # 3.x 的消息库名不止 MSG*.db：MediaMSG*.db（媒体消息）同样可能承载消息表。
+    # 统一用 *MSG*.db 覆盖，由内部的 MSG/ChatCRMsg 表探测过滤，因此多匹配到的
+    # MicroMsg.db（只有 Contact/ChatRoom/Session 表）会被安全跳过。
+    msg_db_files = sorted(set(list(decrypted_dir.rglob("*MSG*.db")) + list(decrypted_dir.rglob("ChatMsg.db"))))
     for db_file in msg_db_files:
         try:
             m_conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
@@ -97,20 +123,37 @@ def sync_v3(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
                 content_col = "StrContent" if "StrContent" in cols else "''"
                 type_col = "Type" if "Type" in cols else "1"
                 time_col = "CreateTime" if "CreateTime" in cols else "0"
+                extra_col = "BytesExtra" if "BytesExtra" in cols else "NULL"
 
-                for r in m_conn.execute(f"SELECT localId, {talker_col} AS StrTalker, IsSender, {type_col} AS Type, {time_col} AS CreateTime, {content_col} AS StrContent FROM '{target_table}'"):
+                for r in m_conn.execute(
+                    f"SELECT localId, {talker_col} AS StrTalker, IsSender, {type_col} AS Type, "
+                    f"{time_col} AS CreateTime, {content_col} AS StrContent, {extra_col} AS BytesExtra "
+                    f"FROM '{target_table}'"
+                ):
                     session_name = r["StrTalker"]
                     if not session_name:
                         continue
                     is_sender = r["IsSender"]
-                    sender_name = "me" if is_sender == 1 else session_name
-                    raw_content = r["StrContent"] or ""
+                    if is_sender == 1:
+                        sender_name = "me"
+                    else:
+                        # 群聊里 StrTalker 是群 ID，真实发言人在 BytesExtra 中；
+                        # 提取失败则回退为群 ID（即修复前的行为）
+                        sender_name = _extract_v3_group_sender(r["BytesExtra"]) or session_name
+                    # 直接存 StrContent 会绕过 build_content，导致 [文件]/[图片] 等
+                    # 标签缺失、search_shared_files 在 3.x 数据上恒为空。统一走同一入口。
+                    content = build_content(r["Type"], r["StrContent"], None)
 
                     cur.execute("""
-                        INSERT OR IGNORE INTO messages 
+                        INSERT INTO messages
                         (source_file, local_id, session_username, sender_username, create_time, local_type, content)
                         VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """, (db_file.name, r["localId"], session_name, sender_name, r["CreateTime"], r["Type"], raw_content))
+                        ON CONFLICT(source_file, session_username, local_id) DO UPDATE SET
+                            sender_username = excluded.sender_username,
+                            create_time     = excluded.create_time,
+                            local_type      = excluded.local_type,
+                            content         = excluded.content
+                    """, (db_file.name, r["localId"], session_name, sender_name, r["CreateTime"], r["Type"], content))
 
             m_conn.close()
         except Exception as e:

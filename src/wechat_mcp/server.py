@@ -118,6 +118,14 @@ def _clamp(limit: Any, default: int, maximum: int) -> int:
     return min(value, maximum)
 
 
+def _safe_offset(offset: Any) -> int:
+    """把外部传入的 offset 收敛为非负整数（SQLite 负 OFFSET 等价于 0）"""
+    try:
+        return max(0, int(offset))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _dedupe_phrases(phrases, min_count: int = 3, scan: int = 200, limit: int = 20) -> List[Dict[str, Any]]:
     """把 n-gram 计数整理成短语列表，并过滤被更长短语完全覆盖的碎片。
 
@@ -162,7 +170,9 @@ def search_wechat_messages(query: str, session_id: Optional[str] = None, limit: 
     tokens = [t for t in (query or "").split() if t]
     if not tokens:
         conn.close()
-        return []
+        # 与 search_contacts / list_chatroom_members 等保持一致：空参数明确报错，
+        # 而不是静默返回空列表让人误以为「确实没有匹配」
+        return [{"error": "query 不能为空"}]
 
     sql = """
         SELECT m.id, m.session_username, s.display_name AS session_name,
@@ -345,13 +355,17 @@ def search_shared_files(keyword: Optional[str] = None, session_id: Optional[str]
 
 @mcp.tool()
 @_db_tool
-def get_messages_by_date(date: str, session_id: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
+def get_messages_by_date(date: str, session_id: Optional[str] = None, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
     """按指定单日（YYYY-MM-DD）查询聊天记录（用于日报分析、事件回溯等）。
-    
+
+    结果按时间正序返回。单日消息数超过 limit 时请用 offset 翻页取后续，
+    否则只能拿到当天最早的一段。
+
     Args:
         date: 日期，格式如 '2026-10-16'
         session_id: 可选，限定特定群聊或联系人
         limit: 返回消息数量，默认 100
+        offset: 跳过前 N 条（默认 0），用于分页
     """
     err = _check_db_initialized()
     if err:
@@ -386,9 +400,10 @@ def get_messages_by_date(date: str, session_id: Optional[str] = None, limit: int
         sql += " AND m.session_username = ?"
         params.append(session_id)
         
-    sql += " ORDER BY m.create_time ASC LIMIT ?"
+    sql += " ORDER BY m.create_time ASC LIMIT ? OFFSET ?"
     params.append(_clamp(limit, 30, 500))
-    
+    params.append(_safe_offset(offset))
+
     rows = cur.execute(sql, params).fetchall()
     results = []
     for r in rows:
@@ -513,14 +528,17 @@ def list_chatroom_members(chatroom_id: str, keyword: Optional[str] = None, limit
 
 @mcp.tool()
 @_db_tool
-def get_messages_by_range(start: str, end: str, session_id: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
+def get_messages_by_range(start: str, end: str, session_id: Optional[str] = None, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
     """按自定义时间范围查询聊天记录（支持跨天与任意时段，比按单日查询更灵活）。
+
+    结果按时间正序返回。范围内消息数超过 limit 时请用 offset 翻页取后续。
 
     Args:
         start: 起始时间，'YYYY-MM-DD' 或 'YYYY-MM-DD HH:MM[:SS]'
         end: 结束时间，同上；只给日期时自动覆盖当天全天
         session_id: 可选，限定某个群聊或联系人
         limit: 返回数量，默认 100
+        offset: 跳过前 N 条（默认 0），用于分页
     """
     err = _check_db_initialized()
     if err:
@@ -546,8 +564,9 @@ def get_messages_by_range(start: str, end: str, session_id: Optional[str] = None
     if session_id:
         sql += " AND m.session_username = ?"
         params.append(session_id)
-    sql += " ORDER BY m.create_time ASC LIMIT ?"
+    sql += " ORDER BY m.create_time ASC LIMIT ? OFFSET ?"
     params.append(_clamp(limit, 30, 500))
+    params.append(_safe_offset(offset))
 
     rows = cur.execute(sql, params).fetchall()
     conn.close()

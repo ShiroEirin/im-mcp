@@ -9,6 +9,11 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
+def _escape_like(value: str) -> str:
+    """Escape LIKE wildcards so user input is matched literally."""
+    return (value or "").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def format_timestamp(ts: Optional[int]) -> str:
     """Format millisecond timestamp to ISO datetime string."""
     if not ts:
@@ -147,8 +152,8 @@ class DingTalkDB:
         """
         params = []
         if keyword:
-            sql += " WHERE title LIKE ?"
-            params.append(f"%{keyword}%")
+            sql += " WHERE title LIKE ? ESCAPE '\\'"
+            params.append(f"%{_escape_like(keyword)}%")
         sql += " ORDER BY lastModify DESC LIMIT ?"
         params.append(limit)
 
@@ -244,43 +249,53 @@ class DingTalkDB:
         cid: Optional[str] = None,
         limit: int = 30,
     ) -> List[Dict[str, Any]]:
-        """Search messages by keyword across all sharded tables."""
-        results = []
+        """Search messages by keyword across all sharded tables.
+
+        Scans **every** shard and then sorts globally by createdAt DESC, so the
+        result really is the most recent ``limit`` matches. The previous version
+        stopped as soon as the quota was filled while iterating shards
+        tbmsg_000..127 in order, so the output was dominated by whatever the
+        low-numbered shards happened to contain instead of the newest hits.
+        """
+        results: List[Dict[str, Any]] = []
         with self.get_connection() as conn:
             for i in range(128):
-                if len(results) >= limit:
-                    break
                 t = f"tbmsg_{i:03d}"
                 try:
                     sql = f"""
                         SELECT primaryKey, cid, mid, senderId, createdAt, contentType, content
                         FROM "{t}"
-                        WHERE content LIKE ? AND recallStatus = 0
+                        WHERE content LIKE ? ESCAPE '\\' AND recallStatus = 0
                     """
-                    params = [f"%{keyword}%"]
+                    params = [f"%{_escape_like(keyword)}%"]
                     if cid:
                         sql += " AND cid = ?"
                         params.append(cid)
 
-                    sql += f" ORDER BY createdAt DESC LIMIT {limit - len(results)}"
+                    sql += " ORDER BY createdAt DESC LIMIT ?"
+                    params.append(limit)
                     rows = conn.execute(sql, params).fetchall()
-                    for r in rows:
-                        parsed = parse_message_content(r["content"], r["contentType"])
-                        if keyword.lower() in parsed["text"].lower() or keyword in str(r["content"]):
-                            sender_name = self.resolve_sender(r["senderId"])
-                            results.append({
-                                "mid": str(r["mid"]),
-                                "cid": str(r["cid"]),
-                                "sender_id": str(r["senderId"]),
-                                "sender_name": sender_name,
-                                "created_at": format_timestamp(r["createdAt"]),
-                                "content_type": r["contentType"],
-                                "content": parsed["text"],
-                            })
                 except sqlite3.OperationalError:
                     continue
 
-        return results
+                for r in rows:
+                    parsed = parse_message_content(r["content"], r["contentType"])
+                    if keyword.lower() in parsed["text"].lower() or keyword in str(r["content"]):
+                        results.append({
+                            "mid": str(r["mid"]),
+                            "cid": str(r["cid"]),
+                            "sender_id": str(r["senderId"]),
+                            "sender_name": self.resolve_sender(r["senderId"]),
+                            "created_at": format_timestamp(r["createdAt"]),
+                            "content_type": r["contentType"],
+                            "content": parsed["text"],
+                            "_raw_ts": r["createdAt"] or 0,
+                        })
+
+        results.sort(key=lambda m: m["_raw_ts"], reverse=True)
+        for m in results:
+            m.pop("_raw_ts", None)
+        return results[:limit]
 
     def list_contacts(self, limit: int = 100, keyword: Optional[str] = None) -> List[Dict[str, Any]]:
         profiles = self.get_user_profiles()

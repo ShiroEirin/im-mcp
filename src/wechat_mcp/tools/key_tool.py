@@ -723,12 +723,41 @@ def load_passphrase() -> str | None:
         return None
 
 
+def _restrict_file_permissions(path: str) -> str:
+    """尽力收紧密钥文件的访问权限，返回实际生效的方式描述。
+
+    POSIX 下 chmod 0600 就够了；Windows 下 os.chmod 只能切换只读位、不构成
+    访问控制，必须用 icacls 断开继承并只授权当前用户，否则该文件对同机其他
+    账户仍然可读。
+    """
+    if os.name == "nt":
+        user = os.environ.get("USERNAME")
+        if not user:
+            logger.warning("未取到 USERNAME，无法用 icacls 收紧密钥文件权限")
+            return "未收紧（取不到 USERNAME）"
+        try:
+            subprocess.run(
+                ["icacls", path, "/inheritance:r", "/grant:r", f"{user}:(R,W)"],
+                capture_output=True, timeout=10, check=False,
+            )
+            return f"icacls 已限制为 {user}"
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"icacls 收紧权限失败（文件仍可被同机其他账户读取）: {exc}")
+            return "icacls 失败（权限未收紧）"
+    try:
+        os.chmod(path, 0o600)
+        return "chmod 0600"
+    except OSError as exc:
+        logger.warning(f"chmod 0600 失败: {exc}")
+        return "chmod 失败（权限未收紧）"
+
+
 def save_passphrase(passphrase: str) -> None:
     os.makedirs(os.path.dirname(PASSPHRASE_FILE), exist_ok=True)
     with open(PASSPHRASE_FILE, "w") as f:
         json.dump({"passphrase": passphrase}, f, indent=2)
-    os.chmod(PASSPHRASE_FILE, 0o600)
-    logger.info(f"passphrase 已保存到 {PASSPHRASE_FILE}")
+    mode = _restrict_file_permissions(PASSPHRASE_FILE)
+    logger.info(f"passphrase 已保存到 {PASSPHRASE_FILE}（权限: {mode}）")
 
 
 # ============================================================

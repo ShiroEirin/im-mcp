@@ -83,6 +83,9 @@ def get_cleanup_targets() -> dict[str, list[Path]]:
         BASE_DIR / "all_keys.json",
         BASE_DIR / ".cache",
         Path.home() / ".wechat_mcp",
+        # key_tool 手动/实验性写入的 32 字节 passphrase 明文文件；此前不在
+        # 清理范围内，im-clean 跑完密钥仍留在磁盘上
+        Path.home() / ".wcdb-key-tool",
     ])
 
     # 2. DuangDuang相关产物

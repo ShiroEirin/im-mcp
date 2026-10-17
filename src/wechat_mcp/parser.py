@@ -90,14 +90,23 @@ def _clean_xml_text(value: str) -> str:
     )
 
 
+# 标签属性段：允许属性值内部出现 '>'（如 <a href="x>y">）。用引号感知的
+# 交替式匹配，避免 [^>]* 在属性值里的第一个 '>' 处提前截断，把 "x>y" 之后
+# 的垃圾当成正文。
+_ATTRS = r"""(?:"[^"]*"|'[^']*'|[^>"'])*"""
+
+
 def extract_tag_from_xml(xml_text: str, tag: str) -> str:
     """提取指定标签内的首个非空文本（跳过自闭合与空标签）"""
     if not xml_text:
         return ""
     # 先剔除自闭合标签（<tag/> 与 <tag />）。它们没有闭合标签，正则的非重叠
     # 扫描会从它一路吞到后面同名的真标签，导致紧随其后的真标签被整体跳过。
-    cleaned = re.sub(rf"<{tag}(?:\s[^>]*)?/>", "", xml_text)
-    pattern = rf"<{tag}((?:\s[^>]*)?)>(.*?)</{tag}>"
+    # \b 保证 <tagattr/> 这类同名前缀不会被误当成 <tag/>。
+    cleaned = re.sub(rf"<{tag}\b(?:{_ATTRS})?/>", "", xml_text)
+    # 正文遇到同名开标签即停止：脏数据里缺闭合标签的 <title>a<title>b</title>
+    # 否则会把两个标签之间的内容整段吞进来。
+    pattern = rf"<{tag}\b({_ATTRS})>((?:(?!<{tag}\b).)*?)</{tag}>"
     for match in re.finditer(pattern, cleaned, re.DOTALL):
         value = _clean_xml_text(match.group(2))
         if value:
@@ -142,9 +151,12 @@ def build_content(local_type: int, raw_content, raw_source) -> str:
             text = maybe_zstd_decompress(raw_content).decode("utf-8", errors="ignore")
         else:
             text = str(raw_content or "")
-        # 群聊消息会把发送者编码成 `wxid_xxx:\n` 前缀（实测与 sender_username 100% 一致、
-        # 私聊从不出现），属冗余标记，清理后正文更可读
-        return re.sub(r"^wxid_[A-Za-z0-9]{4,}:\s*", "", text)
+        # 群聊消息会把发送者编码成 `<sender_id>: ` 前缀（实测与 sender_username 一致、
+        # 私聊从不出现），属冗余标记，清理后正文更可读。除 wxid_ 外，公众号/服务号
+        # 会话还会出现 gh_ 与 <数字>@openim 形式，一并清理。
+        return re.sub(
+            r"^(?:wxid_[A-Za-z0-9_-]{4,}|gh_[A-Za-z0-9_-]{4,}|[0-9]{6,}@openim):\s*", "", text
+        )
 
     # 系统消息（撤回 / 入群提示等）：正文多为可读文本，部分 type 为 sysmsg XML
     if local_type in (10000, 10002):

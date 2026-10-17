@@ -67,10 +67,22 @@ def sync_media_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
         for table, kind in _HARDLINK_TABLES:
             if table not in tables:
                 continue
+            # 列名按 PRAGMA 探测：不同版本的 hardlink 表列名可能有差异，
+            # 硬编码任一列缺失都会让整表读取失败（异常被吞成 warning，
+            # 结果是媒体索引静默为空，且不影响 ETL 成功状态）。
+            h_cols = [r[1] for r in conn.execute(f"PRAGMA table_info('{table}')").fetchall()]
+            if "md5" not in h_cols or "file_name" not in h_cols:
+                logger.warning(f"{table}: 缺少 md5/file_name 列，跳过（实际列: {h_cols}）")
+                continue
+
+            def _col(name: str) -> str:
+                return name if name in h_cols else f"NULL AS {name}"
+
+            select_cols = ", ".join([
+                "md5", "file_name", _col("file_size"), _col("modify_time"), _col("dir1"),
+            ])
             try:
-                rows = conn.execute(
-                    f"SELECT md5, file_name, file_size, modify_time, dir1 FROM {table}"
-                ).fetchall()
+                rows = conn.execute(f"SELECT {select_cols} FROM {table}").fetchall()
             except sqlite3.Error as exc:
                 logger.warning(f"Error reading {table}: {exc}")
                 continue
@@ -88,11 +100,21 @@ def sync_media_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
                 chat_hash = dir_map.get(row["dir1"]) if kind == "image" else None
                 rel_path = _resolve_rel_path(kind, chat_hash, month, row["file_name"] or "")
                 abs_path = str(Path(files_root) / rel_path) if (files_root and rel_path) else ""
+                # UPSERT on (md5, rel_path)：同一 md5 会出现在多个会话目录下，
+                # 旧主键只取 md5 会让后写入的行覆盖先写入的，丢掉路径
                 cur.execute(
                     """
-                    INSERT OR REPLACE INTO media_files
+                    INSERT INTO media_files
                     (md5, kind, file_name, file_size, modify_time, chat_hash, month, rel_path, abs_path)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(md5, rel_path) DO UPDATE SET
+                        kind        = excluded.kind,
+                        file_name   = excluded.file_name,
+                        file_size   = excluded.file_size,
+                        modify_time = excluded.modify_time,
+                        chat_hash   = excluded.chat_hash,
+                        month       = excluded.month,
+                        abs_path    = excluded.abs_path
                     """,
                     (
                         md5,

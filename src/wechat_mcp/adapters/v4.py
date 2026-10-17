@@ -130,7 +130,11 @@ def sync_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
         msg_dir = decrypted_dir / "db_storage" / "message"
 
     if msg_dir.exists():
-        for db_file in sorted(msg_dir.glob("message_*.db")):
+        # 微信 4.x 的消息库不止 message_*.db：biz_message_*.db（服务号/公众号等）
+        # 同样存放 Msg_<md5> 消息表（本机实测 189 张表 / 5191 条消息）。原先只
+        # glob message_*.db 会整库漏掉。改为遍历目录下全部 .db，由内部的 Msg_
+        # 表探测决定是否真有消息，将来新增分片也能自动覆盖。
+        for db_file in sorted(msg_dir.glob("*.db")):
             try:
                 m_conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
                 m_conn.row_factory = sqlite3.Row
@@ -148,7 +152,8 @@ def sync_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
                     pass
 
                 # 遍历所有 Msg_<hash> 表
-                tables = [r[0] for r in m_conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'")]
+                # 用 GLOB 而非 LIKE：LIKE 的 '_' 是单字符通配符，会误匹配 MsgX… 等无关表
+                tables = [r[0] for r in m_conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name GLOB 'Msg_*'")]
 
                 for tbl in tables:
                     tbl_hash = tbl[4:].strip().lower()  # 去掉 'Msg_' 前缀

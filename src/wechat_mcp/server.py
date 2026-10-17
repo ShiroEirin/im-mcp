@@ -8,7 +8,7 @@ from typing import Optional, List, Dict, Any
 from mcp.server.fastmcp import FastMCP
 
 from .config import DB_PATH
-from .database import get_connection, release_connections, sync_data
+from .database import get_connection, init_schema, release_connections, sync_data
 
 # 初始化 FastMCP 服务器
 mcp = FastMCP("wechat-mcp")
@@ -37,7 +37,14 @@ def _check_db_initialized() -> Optional[str]:
         if not cur.fetchone():
             conn.close()
             return "绿泡泡数据库存在但数据表未初始化。请在终端运行 `wechat-init --etl-only` 重建索引。"
+        # 老版本建的库可能缺少后续新增的表（chatroom_members / media_files /
+        # favorites / emoticons），会让对应工具抛裸 OperationalError。init_schema
+        # 是幂等的 CREATE TABLE IF NOT EXISTS，这里直接补齐（表为空，需跑 ETL 才有数据）。
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        have = {r[0] for r in cur.fetchall()}
         conn.close()
+        if {"chatroom_members", "media_files", "favorites", "emoticons"} - have:
+            init_schema()
         return None
     except Exception as e:
         return f"绿泡泡数据库无法访问: {e}。请尝试重新运行 `wechat-init`。"
@@ -577,6 +584,9 @@ def get_chat_activity_stats(session_id: Optional[str] = None, start: Optional[st
     if session_id:
         where.append("m.session_username = ?")
         params.append(session_id)
+    if bool(start) != bool(end):
+        conn.close()
+        return {"error": "start 与 end 必须同时提供（只传其一会被静默忽略，故直接报错）"}
     if start and end:
         try:
             start_ts, end_ts = _time_range_to_ts(cur, start, end)

@@ -8,6 +8,9 @@ if sys.platform == "win32":
 
 from pathlib import Path
 import os
+import logging
+
+logger = logging.getLogger(__name__)
 
 # 基础路径
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
@@ -58,9 +61,11 @@ def get_files_root() -> Path | None:
     if not config_dir.is_dir():
         return None
 
-    for ini_file in config_dir.glob("*.ini"):
+    candidates = []
+    for ini_file in sorted(config_dir.glob("*.ini")):
         content = ""
-        for enc in ("utf-8", "gbk"):
+        # utf-8-sig 优先：微信的 ini 可能带 BOM，带 BOM 时 strip() 去不掉，会导致路径判空
+        for enc in ("utf-8-sig", "utf-8", "gbk"):
             try:
                 content = ini_file.read_text(encoding=enc).strip()[:1024]
                 break
@@ -70,5 +75,22 @@ def get_files_root() -> Path | None:
             continue
         for match in Path(content).glob("xwechat_files/*/db_storage"):
             if match.is_dir():
-                return match.parent
-    return None
+                candidates.append(match.parent)
+
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+
+    # 多账号（多开）时不能依赖 glob 顺序：取 db_storage 最近被写入的那个，
+    # 通常即当前活跃账号，并记录候选以便排查。
+    def _mtime(root: Path) -> float:
+        try:
+            return (root / "db_storage").stat().st_mtime
+        except OSError:
+            return 0.0
+
+    candidates.sort(key=_mtime, reverse=True)
+    logger.warning("检测到多个绿泡泡数据目录，已选用最近活跃的一个: %s（候选: %s）",
+                   candidates[0], ", ".join(str(c) for c in candidates))
+    return candidates[0]

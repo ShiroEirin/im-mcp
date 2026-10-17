@@ -111,6 +111,12 @@ def sync_media_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
         logger.info(f"Indexed {count} media files")
     except Exception as exc:
         logger.warning(f"Error building media index: {exc}")
+    finally:
+        # 异常路径同样要释放只读句柄，避免长期运行下句柄泄漏
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def _extract_tag(xml_text: str, tag: str) -> str:
@@ -163,6 +169,12 @@ def sync_favorites_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
         logger.info(f"Synced {count} favorites")
     except Exception as exc:
         logger.warning(f"Error syncing favorites: {exc}")
+    finally:
+        # 异常路径同样要释放只读句柄，避免长期运行下句柄泄漏
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def sync_emoticons_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
@@ -221,11 +233,18 @@ def sync_emoticons_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
             ):
                 if not row["md5_"]:
                     continue
+                # 非破坏性 UPSERT：同一 md5 可能已由 kNonStoreEmoticonTable 写入
+                # （带 kind='non_store' 与 thumb/cdn/designer）。原 INSERT OR REPLACE
+                # 会把整行覆盖成 kind='store' 并清空这些 URL 字段。
                 cur.execute(
                     """
-                    INSERT OR REPLACE INTO emoticons
+                    INSERT INTO emoticons
                     (md5, caption, package_id, package_name, kind, thumb_url, cdn_url, designer_id)
                     VALUES (?, ?, ?, ?, 'store', '', '', '')
+                    ON CONFLICT(md5) DO UPDATE SET
+                        caption = CASE WHEN emoticons.caption = '' THEN excluded.caption ELSE emoticons.caption END,
+                        package_id = CASE WHEN emoticons.package_id = '' THEN excluded.package_id ELSE emoticons.package_id END,
+                        package_name = CASE WHEN emoticons.package_name = '' THEN excluded.package_name ELSE emoticons.package_name END
                     """,
                     (
                         row["md5_"],
@@ -240,3 +259,9 @@ def sync_emoticons_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
         logger.info(f"Indexed {count} emoticons")
     except Exception as exc:
         logger.warning(f"Error building emoticon index: {exc}")
+    finally:
+        # 异常路径同样要释放只读句柄，避免长期运行下句柄泄漏
+        try:
+            conn.close()
+        except Exception:
+            pass

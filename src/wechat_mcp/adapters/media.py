@@ -18,6 +18,7 @@ import sqlite3
 from pathlib import Path
 
 from ..config import get_files_root
+from ..parser import extract_tag_from_xml
 
 logger = logging.getLogger(__name__)
 
@@ -113,20 +114,8 @@ def sync_media_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
 
 
 def _extract_tag(xml_text: str, tag: str) -> str:
-    """从收藏 XML 中提取首个标签文本（处理 CDATA 与常见实体）"""
-    match = re.search(rf"<{tag}[^>]*>(.*?)</{tag}>", xml_text or "", re.DOTALL)
-    if not match:
-        return ""
-    value = match.group(1).strip()
-    value = re.sub(r"^<!\[CDATA\[(.*?)\]\]>$", r"\1", value, flags=re.DOTALL)
-    return (
-        value.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&amp;", "&")
-        .replace("&quot;", '"')
-        .replace("&apos;", "'")
-        .strip()
-    )
+    """从收藏 XML 中提取首个非空标签文本（复用 parser 的统一实现，避免两处分叉）"""
+    return extract_tag_from_xml(xml_text or "", tag)
 
 
 def sync_favorites_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:

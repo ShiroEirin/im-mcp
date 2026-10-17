@@ -53,7 +53,7 @@ def sync_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
                 if "contact" in tables:
                     # 动态检测 contact 列名 (4.x 为 local_type，兼容防御 type)
                     cols = [r[1] for r in c_conn.execute("PRAGMA table_info(contact)").fetchall()]
-                    type_col = "local_type" if "local_type" in cols else ("type" if "type" in cols else "0 as local_type")
+                    type_col = "local_type" if "local_type" in cols else ("type" if "type" in cols else "0")
                     rows = c_conn.execute(f"SELECT username, alias, remark, nick_name, {type_col} AS local_type FROM contact").fetchall()
                     for r in rows:
                         uname = r["username"]
@@ -104,7 +104,7 @@ def sync_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
                 s_conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
                 s_conn.row_factory = sqlite3.Row
                 cols = [r[1] for r in s_conn.execute("PRAGMA table_info(SessionTable)").fetchall()]
-                time_col = "last_timestamp" if "last_timestamp" in cols else ("last_time" if "last_time" in cols else "0 as last_timestamp")
+                time_col = "last_timestamp" if "last_timestamp" in cols else ("last_time" if "last_time" in cols else "0")
                 
                 for r in s_conn.execute(f"SELECT username, summary, {time_col} AS last_time FROM SessionTable"):
                     uname = r["username"]
@@ -174,11 +174,19 @@ def sync_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
                         target_session = session_name or f"chat_{tbl_hash}"
                         content = build_content(r["local_type"], r["message_content"], r["source"])
 
-                        # 用 REPLACE 而非 IGNORE：解析逻辑升级后重跑 ETL 可刷新既有消息内容
+                        # 用 UPSERT 而非 INSERT OR REPLACE：REPLACE 是「先删后插」，
+                        # 而 recursive_triggers 默认关闭，AFTER DELETE 触发器不会触发，
+                        # messages_fts 会残留旧词条；且新行会拿到新的自增 id，导致主键
+                        # 每次 ETL 都漂移、索引无界膨胀。UPSERT 原地更新，rowid 稳定。
                         cur.execute("""
-                            INSERT OR REPLACE INTO messages 
+                            INSERT INTO messages
                             (source_file, local_id, session_username, sender_username, create_time, local_type, content)
                             VALUES (?, ?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(source_file, session_username, local_id) DO UPDATE SET
+                                sender_username = excluded.sender_username,
+                                create_time     = excluded.create_time,
+                                local_type      = excluded.local_type,
+                                content         = excluded.content
                         """, (db_file.name, r["local_id"], target_session, sender_name, r["create_time"], r["local_type"], content))
 
                 m_conn.close()

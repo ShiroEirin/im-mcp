@@ -97,6 +97,11 @@ def init_schema():
             INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.id, old.content);
         END;
 
+        CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
+            INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.id, old.content);
+            INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+        END;
+
         CREATE TABLE IF NOT EXISTS media_files (
             md5 TEXT PRIMARY KEY,
             kind TEXT NOT NULL,
@@ -138,9 +143,14 @@ def init_schema():
     conn.commit()
     conn.close()
 
+# ETL 解析/中间库结构版本号。解析逻辑或表结构变化时必须递增，
+# 否则老用户升级后源库文件未变 -> 指纹一致 -> 直接 skipped，新逻辑永不生效。
+ETL_SCHEMA_VERSION = "3"
+
+
 def compute_fingerprint(decrypted_dir: Path) -> str:
-    """按文件修改时间与大小计算指纹"""
-    items = []
+    """按 ETL 版本 + 源库文件修改时间与大小计算指纹"""
+    items = [f"etl:{ETL_SCHEMA_VERSION}"]
     for p in sorted(decrypted_dir.rglob("*.db")):
         try:
             stat = p.stat()
@@ -185,11 +195,17 @@ def sync_data(force: bool = False) -> dict:
     # 按版本路由执行解密数据库同步 (v3 / v4 / 扩展版本)
     adapter_used = route_sync(decrypted_dir, cur)
 
-    # 媒体文件索引与收藏条目（绿泡泡 4.x 的独立数据库）
+    # 媒体文件索引与收藏条目（绿泡泡 4.x 的独立数据库）。
+    # 任一附加库解析失败都不应中断主流程，但要如实记录到返回值里。
+    warnings: list = []
     if adapter_used in ("v4", "fallback"):
-        sync_media_v4(decrypted_dir, cur)
-        sync_favorites_v4(decrypted_dir, cur)
-        sync_emoticons_v4(decrypted_dir, cur)
+        for name, fn in (("media", sync_media_v4), ("favorites", sync_favorites_v4),
+                         ("emoticons", sync_emoticons_v4)):
+            try:
+                fn(decrypted_dir, cur)
+            except Exception as exc:  # noqa: BLE001 - 单个附加库失败不影响主同步
+                warnings.append(f"{name}: {exc}")
+                logger.warning(f"Sync {name} failed: {exc}")
 
     # 更新会话统计与 FTS 索引
     cur.execute("""
@@ -198,13 +214,24 @@ def sync_data(force: bool = False) -> dict:
         )
     """)
 
+    # 重建 FTS 索引：历史版本用 INSERT OR REPLACE 写入，旧词条会残留
+    # （recursive_triggers 默认关闭，AFTER DELETE 触发器不触发），此处一次性自愈。
+    try:
+        cur.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
+    except sqlite3.Error as exc:
+        warnings.append(f"fts rebuild: {exc}")
+        logger.warning(f"FTS rebuild failed: {exc}")
+
     cur.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('fingerprint', ?)", (fp,))
     conn.commit()
     stats = _collect_stats(cur)
     conn.close()
-    return {
+    result = {
         "status": "success",
         "message": f"Database synchronized successfully (adapter: {adapter_used})",
         "adapter": adapter_used,
         **stats,
     }
+    if warnings:
+        result["warnings"] = warnings
+    return result

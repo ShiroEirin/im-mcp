@@ -94,10 +94,11 @@ def extract_tag_from_xml(xml_text: str, tag: str) -> str:
     """提取指定标签内的首个非空文本（跳过自闭合与空标签）"""
     if not xml_text:
         return ""
+    # 先剔除自闭合标签（<tag/> 与 <tag />）。它们没有闭合标签，正则的非重叠
+    # 扫描会从它一路吞到后面同名的真标签，导致紧随其后的真标签被整体跳过。
+    cleaned = re.sub(rf"<{tag}(?:\s[^>]*)?/>", "", xml_text)
     pattern = rf"<{tag}((?:\s[^>]*)?)>(.*?)</{tag}>"
-    for match in re.finditer(pattern, xml_text, re.DOTALL):
-        if match.group(1).rstrip().endswith("/"):
-            continue  # 自闭合标签 <tag />，跳过以免吞掉后续正文
+    for match in re.finditer(pattern, cleaned, re.DOTALL):
         value = _clean_xml_text(match.group(2))
         if value:
             return value
@@ -107,6 +108,32 @@ def extract_tag_from_xml(xml_text: str, tag: str) -> str:
 def extract_title_from_xml(xml_text: str) -> str:
     """从 appmsg XML 中提取 <title> 内容"""
     return extract_tag_from_xml(xml_text, "title")
+
+def _summarize_quoted(quoted: str) -> str:
+    """被引用的消息本身若是 appmsg，其 <content> 里嵌的是整段原始 XML。
+
+    此时再解析一层，取出可读的 <title>/<des>，避免把整段 XML 当成引用原文
+    直接塞进正文。解析不出可读字段时按嵌套根标签退化为类型占位。
+    """
+    raw = quoted or ""
+    text = raw.lstrip()
+    # 群聊中被引用内容可能带 "wxid_xxx: " 发送者前缀；仅当剥掉前缀后确实以
+    # XML 开头时才剥离，避免误伤形如 "abc123: 你好" 的正常引用文本。
+    stripped = re.sub(r"^[A-Za-z0-9_.\-@]{4,}:\s*", "", text, count=1)
+    if stripped.startswith("<?xml") or stripped.startswith("<msg"):
+        text = stripped
+    elif not (text.startswith("<?xml") or text.startswith("<msg")):
+        return raw
+    for tag in ("title", "des", "content"):
+        value = extract_tag_from_xml(text, tag)
+        value = (value or "").strip()
+        if value and not value.startswith("<"):
+            return value
+    for token, label in (("<img", "[图片]"), ("<video", "[视频]"), ("<emoji", "[表情]")):
+        if token in text:
+            return label
+    return "[多媒体消息]"
+
 
 def build_content(local_type: int, raw_content, raw_source) -> str:
     """将 raw_content / raw_source 根据 local_type 构建成可读字符串"""
@@ -145,7 +172,7 @@ def build_content(local_type: int, raw_content, raw_source) -> str:
         # 引用消息：<title> 是本次回复内容，<refermsg> 里才是被引用原文与作者
         if app_type == 57:
             reply = extract_tag_from_xml(xml_text, "title")
-            quoted = extract_tag_from_xml(xml_text, "content")
+            quoted = _summarize_quoted(extract_tag_from_xml(xml_text, "content"))
             who = extract_tag_from_xml(xml_text, "displayname")
             if quoted:
                 head = f"[引用 {who}: {quoted}]" if who else f"[引用: {quoted}]"

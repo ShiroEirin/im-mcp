@@ -57,10 +57,13 @@ def _normalize_ts(ts: int) -> float:
 
 
 def _ts_to_str(ts: int) -> str:
-    """时间戳转人类可读时间"""
+    """时间戳转人类可读时间（越界/非法值返回空串，避免单条脏数据中断整次查询）"""
     if not ts:
         return ""
-    return datetime.datetime.fromtimestamp(_normalize_ts(ts)).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        return datetime.datetime.fromtimestamp(_normalize_ts(ts)).strftime("%Y-%m-%d %H:%M:%S")
+    except (OverflowError, OSError, ValueError):
+        return ""
 
 
 def _parse_time_bound(value: str) -> datetime.datetime:
@@ -91,6 +94,21 @@ def _time_range_to_ts(cur: sqlite3.Cursor, start: str, end: str) -> tuple:
 def _escape_like(value: str) -> str:
     """转义 LIKE 通配符（% _ \\），使用户输入按字面量匹配"""
     return (value or "").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _clamp(limit: Any, default: int, maximum: int) -> int:
+    """把外部传入的 limit 钳制到合法区间。
+
+    SQLite 中 ``LIMIT -1`` 等价于「无限制」，负数或 0 会让单次调用全表返回，
+    因此统一收敛为 [1, maximum]，非法值回退到 default。
+    """
+    try:
+        value = int(limit)
+    except (TypeError, ValueError):
+        return default
+    if value <= 0:
+        return default
+    return min(value, maximum)
 
 
 def _dedupe_phrases(phrases, min_count: int = 3, scan: int = 200, limit: int = 20) -> List[Dict[str, Any]]:
@@ -157,7 +175,7 @@ def search_wechat_messages(query: str, session_id: Optional[str] = None, limit: 
         params.append(session_id)
 
     sql += " ORDER BY m.create_time DESC LIMIT ? OFFSET ?"
-    params.extend([limit, max(0, offset)])
+    params.extend([_clamp(limit, 20, 500), max(0, offset)])
 
     rows = cur.execute(sql, params).fetchall()
 
@@ -202,7 +220,7 @@ def list_wechat_sessions(keyword: Optional[str] = None, session_type: Optional[s
         params.append(session_type)
         
     sql += " ORDER BY last_time DESC LIMIT ?"
-    params.append(limit)
+    params.append(_clamp(limit, 30, 500))
     
     rows = cur.execute(sql, params).fetchall()
     results = []
@@ -234,7 +252,7 @@ def get_session_history(session_id: str, limit: int = 50, days: Optional[int] = 
     conn = get_connection()
     cur = conn.cursor()
     
-    limit = min(limit, 200)
+    limit = _clamp(limit, 50, 200)
     sql = """
         SELECT m.id, m.sender_username, c.display_name AS sender_name,
                m.create_time, m.content
@@ -252,7 +270,7 @@ def get_session_history(session_id: str, limit: int = 50, days: Optional[int] = 
         params.append(start_ts)
         
     sql += " ORDER BY m.create_time DESC LIMIT ?"
-    params.append(limit)
+    params.append(_clamp(limit, 30, 500))
     
     rows = cur.execute(sql, params).fetchall()
     
@@ -303,7 +321,7 @@ def search_shared_files(keyword: Optional[str] = None, session_id: Optional[str]
         params.append(session_id)
         
     sql += " ORDER BY m.create_time DESC LIMIT ?"
-    params.append(limit)
+    params.append(_clamp(limit, 30, 500))
     
     rows = cur.execute(sql, params).fetchall()
     results = []
@@ -362,7 +380,7 @@ def get_messages_by_date(date: str, session_id: Optional[str] = None, limit: int
         params.append(session_id)
         
     sql += " ORDER BY m.create_time ASC LIMIT ?"
-    params.append(limit)
+    params.append(_clamp(limit, 30, 500))
     
     rows = cur.execute(sql, params).fetchall()
     results = []
@@ -412,7 +430,7 @@ def search_contacts(keyword: str, limit: int = 30) -> List[Dict[str, Any]]:
         WHERE display_name LIKE ? ESCAPE '\\' OR alias LIKE ? ESCAPE '\\' OR username LIKE ? ESCAPE '\\'
         ORDER BY CASE WHEN alias IS NULL OR alias = '' THEN 1 ELSE 0 END, display_name
         LIMIT ?
-    """, (kw, kw, kw, limit)).fetchall()
+    """, (kw, kw, kw, _clamp(limit, 30, 500))).fetchall()
     conn.close()
     return [
         {
@@ -463,7 +481,7 @@ def list_chatroom_members(chatroom_id: str, keyword: Optional[str] = None, limit
         kw = f"%{_escape_like(keyword.strip())}%"
         params.extend([kw, kw, kw])
     sql += " ORDER BY display_name LIMIT ?"
-    params.append(limit)
+    params.append(_clamp(limit, 30, 500))
 
     rows = cur.execute(sql, params).fetchall()
     session_row = cur.execute(
@@ -522,7 +540,7 @@ def get_messages_by_range(start: str, end: str, session_id: Optional[str] = None
         sql += " AND m.session_username = ?"
         params.append(session_id)
     sql += " ORDER BY m.create_time ASC LIMIT ?"
-    params.append(limit)
+    params.append(_clamp(limit, 30, 500))
 
     rows = cur.execute(sql, params).fetchall()
     conn.close()
@@ -640,7 +658,7 @@ def search_media_files(keyword: Optional[str] = None, kind: Optional[str] = None
         sql += " AND month = ?"
         params.append(month.strip())
     sql += " ORDER BY modify_time DESC LIMIT ?"
-    params.append(limit)
+    params.append(_clamp(limit, 30, 500))
 
     rows = cur.execute(sql, params).fetchall()
     conn.close()
@@ -681,7 +699,7 @@ def list_favorites(keyword: Optional[str] = None, limit: int = 20) -> List[Dict[
         sql += " AND (title LIKE ? ESCAPE '\\' OR description LIKE ? ESCAPE '\\')"
         params.extend([kw, kw])
     sql += " ORDER BY update_time DESC LIMIT ?"
-    params.append(limit)
+    params.append(_clamp(limit, 30, 500))
 
     rows = cur.execute(sql, params).fetchall()
     conn.close()
@@ -725,7 +743,7 @@ def list_emoticons(keyword: Optional[str] = None, package: Optional[str] = None,
         sql += " AND package_name LIKE ? ESCAPE '\\'"
         params.append(f"%{_escape_like(package.strip())}%")
     sql += " ORDER BY CASE WHEN caption = '' THEN 1 ELSE 0 END, package_name, caption LIMIT ?"
-    params.append(limit)
+    params.append(_clamp(limit, 30, 500))
     rows = cur.execute(sql, params).fetchall()
     conn.close()
     return [dict(r) for r in rows]
@@ -812,7 +830,7 @@ def get_persona_style(sender: str, session_id: Optional[str] = None, sample_limi
         sql += " AND session_username = ?"
         params.append(session_id)
     sql += " ORDER BY create_time DESC LIMIT ?"
-    params.append(max(1, min(sample_limit, 2000)))
+    params.append(_clamp(sample_limit, 300, 2000))
 
     rows = cur.execute(sql, params).fetchall()
     conn.close()

@@ -716,11 +716,21 @@ def _derive_keys_from_passphrase(passphrase: bytes, db_files: list, salt_to_dbs:
 
 
 def load_passphrase() -> str | None:
+    """读取已保存的 passphrase，格式非法时视为未保存（回退到内存扫描）。"""
     try:
         with open(PASSPHRASE_FILE, "r") as f:
-            return json.load(f).get("passphrase")
-    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+            ph = json.load(f).get("passphrase")
+    except (OSError, ValueError, AttributeError, TypeError):
         return None
+    if not ph:
+        return None
+    ph = str(ph).strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", ph):
+        logger.warning(
+            f"已保存的 passphrase 不是 64 位十六进制字符串，已忽略该文件: {PASSPHRASE_FILE}"
+        )
+        return None
+    return ph
 
 
 def _restrict_file_permissions(path: str) -> str:
@@ -736,14 +746,19 @@ def _restrict_file_permissions(path: str) -> str:
             logger.warning("未取到 USERNAME，无法用 icacls 收紧密钥文件权限")
             return "未收紧（取不到 USERNAME）"
         try:
-            subprocess.run(
+            proc = subprocess.run(
                 ["icacls", path, "/inheritance:r", "/grant:r", f"{user}:(R,W)"],
                 capture_output=True, timeout=10, check=False,
             )
-            return f"icacls 已限制为 {user}"
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"icacls 收紧权限失败（文件仍可被同机其他账户读取）: {exc}")
             return "icacls 失败（权限未收紧）"
+        if proc.returncode != 0:
+            # 之前不看返回码，icacls 失败也会报「已限制」，等于对外谎报安全状态
+            detail = (proc.stderr or proc.stdout or b"").decode("utf-8", "replace").strip()
+            logger.warning(f"icacls 返回 {proc.returncode}，密钥文件权限未收紧: {detail}")
+            return "icacls 失败（权限未收紧）"
+        return f"icacls 已限制为 {user}"
     try:
         os.chmod(path, 0o600)
         return "chmod 0600"
@@ -838,7 +853,23 @@ def auto_detect_db_dir() -> str | None:
             if os.path.isdir(match) and match not in candidates:
                 candidates.append(match)
 
-    return candidates[0] if candidates else None
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+
+    # 多账号（多开）时不能依赖 glob 顺序：取 db_storage 最近被写入的那个，
+    # 通常即当前活跃账号，与 config.get_files_root() 保持同一套选择策略。
+    def _mtime(path: str) -> float:
+        try:
+            return os.path.getmtime(path)
+        except OSError:
+            return 0.0
+
+    candidates.sort(key=_mtime, reverse=True)
+    logger.warning("检测到多个绿泡泡数据目录，已选用最近活跃的一个: %s（候选: %s）",
+                   candidates[0], ", ".join(candidates))
+    return candidates[0]
 
 
 # ============================================================
@@ -978,7 +1009,13 @@ def cmd_extract(args: argparse.Namespace) -> None:
     passphrase_hex = load_passphrase()
     if passphrase_hex:
         _print("[*] 使用已保存的 passphrase 派生密钥（PBKDF2，约需 30-60 秒）...")
-        key_map = _derive_keys_from_passphrase(bytes.fromhex(passphrase_hex), db_files, salt_to_dbs)
+        try:
+            key_map = _derive_keys_from_passphrase(
+                bytes.fromhex(passphrase_hex), db_files, salt_to_dbs
+            )
+        except (ValueError, TypeError) as exc:
+            _print(f"[!] 已保存的 passphrase 无法解析（{exc}），改走内存扫描")
+            key_map = {}
         if key_map:
             _print(f"[+] passphrase 派生成功: {len(key_map)}/{len(salt_to_dbs)} 密钥")
             _save_results(db_files, salt_to_dbs, key_map, db_dir, out_file)
@@ -1048,6 +1085,10 @@ def main() -> None:
     extract_cmd.add_argument("--db-dir", help="绿泡泡 db_storage 目录（默认自动检测）")
     extract_cmd.add_argument("--output", default="all_keys.json")
     extract_cmd.add_argument("--decrypt", action="store_true")
+    extract_cmd.add_argument(
+        "--decrypted-dir", default="decrypted",
+        help="配合 --decrypt 使用，解密后数据库的输出目录（默认 decrypted）",
+    )
 
     capture_cmd = sub.add_parser(
         "capture-experimental",

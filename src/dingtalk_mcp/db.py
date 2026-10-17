@@ -14,6 +14,22 @@ def _escape_like(value: str) -> str:
     return (value or "").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+def _clamp(limit: Any, default: int, maximum: int) -> int:
+    """把外部传入的 limit 钳制到合法区间。
+
+    SQLite 中 ``LIMIT -1`` 等价于「无限制」，0 或负数会让单次调用返回全表；
+    列表切片 ``messages[-limit:]`` 在 limit<=0 时同样会退化成「几乎全部」。
+    因此统一收敛为 [1, maximum]，非法值回退到 default。
+    """
+    try:
+        value = int(limit)
+    except (TypeError, ValueError):
+        return default
+    if value <= 0:
+        return default
+    return min(value, maximum)
+
+
 def format_timestamp(ts: Optional[int]) -> str:
     """Format millisecond timestamp to ISO datetime string."""
     if not ts:
@@ -145,6 +161,7 @@ class DingTalkDB:
         return sid
 
     def list_conversations(self, limit: int = 50, keyword: Optional[str] = None) -> List[Dict[str, Any]]:
+        limit = _clamp(limit, 50, 500)
         profiles = self.get_user_profiles()
         sql = """
             SELECT cid, title, lastModify, unreadCount, status
@@ -189,6 +206,7 @@ class DingTalkDB:
         after_time: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Get messages for a conversation across all sharded tables."""
+        limit = _clamp(limit, 50, 500)
         messages = []
         with self.get_connection() as conn:
             # First find which table(s) contain this cid
@@ -258,6 +276,7 @@ class DingTalkDB:
         low-numbered shards happened to contain instead of the newest hits.
         """
         results: List[Dict[str, Any]] = []
+        limit = _clamp(limit, 30, 500)
         with self.get_connection() as conn:
             for i in range(128):
                 t = f"tbmsg_{i:03d}"
@@ -298,6 +317,7 @@ class DingTalkDB:
         return results[:limit]
 
     def list_contacts(self, limit: int = 100, keyword: Optional[str] = None) -> List[Dict[str, Any]]:
+        limit = _clamp(limit, 100, 1000)
         profiles = self.get_user_profiles()
         results = []
         for p in profiles.values():

@@ -29,6 +29,9 @@ def detect_dingtalk_user() -> Tuple[Optional[str], Optional[str], int, Optional[
     env_dir = os.environ.get("DINGTALK_DATA_DIR", "").strip()
 
     if env_uid and env_dir:
+        # normpath 去掉尾部分隔符：否则 basename(".../acct_v3/") == ""，
+        # 会被误判成 V2，用错误的 key 解密（表现为 SQLite 头部校验失败）。
+        env_dir = os.path.normpath(env_dir)
         ver = 3 if "_v3" in os.path.basename(env_dir) else 2
         salt = read_v3_salt(env_dir) if ver == 3 else None
         return env_dir, env_uid, ver, salt
@@ -203,6 +206,15 @@ def decrypt_dingtalk(
 
         out_db = os.path.join(output_dir, "dingtalk.db")
         out_wal = os.path.join(output_dir, "dingtalk.db-wal")
+        out_shm = os.path.join(output_dir, "dingtalk.db-shm")
+
+        # 上一次运行残留的 WAL/SHM 会被 SQLite 叠加到刚解密出来的库上，
+        # 直接把库读成 "database disk image is malformed"，必须先清掉。
+        for stale in (out_wal, out_shm):
+            try:
+                os.remove(stale)
+            except OSError:
+                pass
 
         decrypt_db_file(temp_enc_db, out_db, key, is_wal=False)
 
@@ -223,6 +235,11 @@ def decrypt_dingtalk(
                 conn.close()
             except Exception as e:
                 logger.warning(f"WAL checkpoint warning: {e}")
+            # -shm 只是可重建的索引缓存，留下旧文件只会干扰后续读取
+            try:
+                os.remove(out_shm)
+            except OSError:
+                pass
 
         return out_db
     finally:

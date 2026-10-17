@@ -59,9 +59,15 @@ def sync_media_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
         # dir2id.rowid → 会话哈希目录名（图片按会话分目录存放）
         dir_map: dict[int, str] = {}
         if "dir2id" in tables:
-            for row in conn.execute("SELECT rowid, username FROM dir2id"):
-                if row[1]:
-                    dir_map[row[0]] = row[1]
+            d_cols = [r[1] for r in conn.execute("PRAGMA table_info(dir2id)").fetchall()]
+            if "username" in d_cols:
+                for row in conn.execute("SELECT rowid, username FROM dir2id"):
+                    if row[1]:
+                        dir_map[row[0]] = row[1]
+            else:
+                # 列名差异不应让整张媒体索引失败：该异常会冒泡出 sync_media_v4
+                # 的 try，导致本轮媒体索引整体为空
+                logger.warning(f"dir2id 缺少 username 列（实际: {d_cols}），图片目录映射不可用")
 
         count = 0
         for table, kind in _HARDLINK_TABLES:

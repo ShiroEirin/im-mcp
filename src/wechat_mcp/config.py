@@ -39,3 +39,36 @@ def get_decrypted_dir() -> Path:
         return dot_dir
     # 默认返回全局家目录
     return DEFAULT_DECRYPTED_DIR
+
+
+def get_files_root() -> Path | None:
+    """定位绿泡泡文件根目录（db_storage 的上一级），供媒体文件路径解析使用。
+
+    优先读环境变量 WECHAT_FILES_ROOT；否则复用 wechat-init 同源的探测逻辑
+    （读取 %APPDATA%\\Tencent\\xwechat\\config\\*.ini 指向的数据根目录）。
+    """
+    env_root = os.environ.get("WECHAT_FILES_ROOT")
+    if env_root:
+        p = Path(env_root)
+        if p.exists():
+            return p
+
+    appdata = os.environ.get("APPDATA", "")
+    config_dir = Path(appdata) / "Tencent" / "xwechat" / "config"
+    if not config_dir.is_dir():
+        return None
+
+    for ini_file in config_dir.glob("*.ini"):
+        content = ""
+        for enc in ("utf-8", "gbk"):
+            try:
+                content = ini_file.read_text(encoding=enc).strip()[:1024]
+                break
+            except (UnicodeDecodeError, OSError):
+                continue
+        if not content or not Path(content).is_dir():
+            continue
+        for match in Path(content).glob("xwechat_files/*/db_storage"):
+            if match.is_dir():
+                return match.parent
+    return None

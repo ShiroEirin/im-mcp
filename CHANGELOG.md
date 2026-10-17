@@ -3,7 +3,7 @@
 本文件逐条记录本仓库相对上游 `stkoecn/im-mcp` 初始版本（v0.0.1）的全部改动，
 便于上游维护者对照 review（对应 PR #10）。所有改动均已实测复现后再修改。
 
-## 新增 MCP 工具（绿泡泡侧 6 → 15 个，全部只读）
+## 新增 MCP 工具（绿泡泡侧 6 → 18 个，全部只读）
 
 | 工具 | 说明 |
 |---|---|
@@ -16,6 +16,21 @@
 | `list_emoticons` | 表情包与表情（含官方文字说明） |
 | `get_persona_style` | 沟通风格蒸馏（画像 + 高频用语 + 典型语句） |
 | `get_sync_status` | 索引新鲜度与规模（判断是否需要重新同步） |
+| `find_message_images` | 定位 `[图片]` 消息的原图 `.dat` 路径，并给出 `dat_version` / `dat_decodable`（V1 可离线解码，V2 需账号级 AES 密钥） |
+| `find_message_covers` | 定位消息附带的**真实封面图**（链接卡片 / 视频号 / 位置卡片），与消息流同为 `create_time ASC` |
+| `read_media_data_url` | 把媒体文件读成可直接放进 `<img src>` 的 data URL；`.dat` 走容器解码，缺 V2 密钥时返回 `need_key=true` 而不报错 |
+
+> 为什么需要这三个工具：`messages` 表里 `[图片]` 消息**只有 `content` 占位符，既无 md5 也无磁盘路径**，
+> 调用方无法定位原图文件。原图实际位于 `msg/attach/<chat_hash>/<YYYY-MM>/Img/<md5>.dat`，
+> 其中 **`chat_hash == md5(session_username)`**；`.dat` 是私有容器
+> `[15B 头][AES-ECB 段][16B 固定标记][单字节 XOR 段]`，V1 密钥硬编码可解，
+> V2 密钥为账号级、只存在于运行中的绿泡泡进程内存。
+> 注意：`cache/<月>/Message/<hash>/Thumb/*.jpg` 是 **appmsg 封面图**，不是 `[图片]` 消息原图。
+
+### 安全边界
+
+- `read_media_data_url` **只允许读取 `get_files_root()` 目录下的文件**；未配置该目录时直接拒绝，
+  避免该工具退化成「任意文件读取器」（已实测：目录外路径被拒、目录内路径放行）。
 
 ## 新增参数 / 行为
 

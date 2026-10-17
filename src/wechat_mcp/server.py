@@ -7,8 +7,13 @@ from typing import Optional, List, Dict, Any
 
 from mcp.server.fastmcp import FastMCP
 
-from .config import DB_PATH
+from .config import DB_PATH, get_files_root
 from .database import get_connection, init_schema, release_connections, sync_data
+from .adapters.images import (
+    chat_hash_of,
+    read_media_data_url as _read_media_data_url,
+    thumb_path_for,
+)
 
 # 初始化 FastMCP 服务器
 mcp = FastMCP("wechat-mcp")
@@ -705,6 +710,276 @@ def search_media_files(keyword: Optional[str] = None, kind: Optional[str] = None
         }
         for r in rows
     ]
+
+@mcp.tool()
+@_db_tool
+def find_message_images(
+    session_id: str,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    limit: int = 60,
+    offset: int = 0,
+) -> Dict[str, Any]:
+    """定位某会话里的**图片消息**，并给出其 .dat 原图路径与可解码性。
+
+    背景：绿泡泡消息正文只存 [图片] 占位符，既无 md5 也无路径。图片落在
+    ``msg/attach/{md5(username)}/{YYYY-MM}/Img/{md5}.dat`` 私有容器里
+    （实测 chat_hash == md5(username)，104/104 命中）。
+
+    容器结构（实测 30/30 精确吻合）::
+
+        [15 字节头] + [AES-ECB 段] + [16 字节固定标记] + [单字节 XOR 段]
+
+    * V1 的 AES 密钥是硬编码常量，可完全离线解码（dat_decodable=True）；
+    * V2 的 AES 密钥是账号级密钥，**必须从运行中的绿泡泡进程提取**；
+    * 本机 5 万余个 .dat 全部是 V2，因此在拿到账号密钥前 dat_decodable=False。
+      多路离线推导（DB 密钥 / salt / wxid 派生 / 全 256 单字节 XOR / 已知明文
+      攻击）均已实测排除，不是实现问题而是密钥确实不在磁盘上。
+
+    原图路径按「同会话 + 同月 + mtime 最接近该消息」匹配，属**近似值**，
+    用 dat_match='nearest-in-month' 明确标注。
+
+    Args:
+        session_id: 会话 username（群为 xxx@chatroom），用 list_wechat_sessions 获取
+        start: 可选，起始时间 YYYY-MM-DD [HH:MM[:SS]]
+        end: 可选，结束时间；只给日期时自动覆盖当天全天
+        limit: 返回条数，默认 60
+        offset: 分页偏移，默认 0
+
+    Returns:
+        {session_id, chat_hash, total, returned, decodable, images:[...]}；
+        每项含 time / sender_name / content / dat_path / dat_exists /
+        dat_version / dat_decodable / dat_match。
+    """
+    err = _check_db_initialized()
+    if err:
+        return {"error": err}
+    conn = get_connection()
+    cur = conn.cursor()
+
+    where = ["m.session_username = ?", "m.content LIKE ?"]
+    params: List[Any] = [session_id, "%[图片]%"]
+    if start and end:
+        try:
+            start_ts, end_ts = _time_range_to_ts(cur, start, end)
+        except ValueError as exc:
+            conn.close()
+            return {"error": str(exc)}
+        where.append("m.create_time >= ? AND m.create_time < ?")
+        params.extend([start_ts, end_ts])
+
+    base_sql = (
+        "FROM messages m LEFT JOIN contacts c ON c.username = m.sender_username "
+        "WHERE " + " AND ".join(where)
+    )
+    total = cur.execute("SELECT COUNT(*) " + base_sql, params).fetchone()[0] or 0
+    rows = cur.execute(
+        "SELECT m.id, m.session_username, m.sender_username, "
+        "c.display_name AS sender_name, m.create_time, m.content "
+        + base_sql
+        + " ORDER BY m.create_time ASC LIMIT ? OFFSET ?",
+        params + [_clamp(limit, 60, 300), _safe_offset(offset)],
+    ).fetchall()
+
+    # 同会话同月的媒体索引（.dat 原图近似匹配用）
+    files_root = get_files_root()
+    chash = chat_hash_of(session_id)
+    media_by_month: Dict[str, List[Any]] = {}
+    if files_root:
+        for r in cur.execute(
+            "SELECT month, abs_path, modify_time FROM media_files "
+            "WHERE kind = 'image' AND chat_hash = ? AND abs_path <> ''",
+            (chash,),
+        ):
+            media_by_month.setdefault(r["month"] or "", []).append(
+                (int(_normalize_ts(r["modify_time"] or 0)), r["abs_path"])
+            )
+    conn.close()
+
+    images: List[Dict[str, Any]] = []
+    decodable = 0
+    for r in rows:
+        ts = int(_normalize_ts(r["create_time"]))
+        month = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m") if ts else ""
+        dat_path = ""
+        dat_match = ""
+        candidates = media_by_month.get(month) or []
+        if candidates:
+            nearest = min(candidates, key=lambda item: abs(item[0] - ts))
+            dat_path = nearest[1]
+            dat_match = "nearest-in-month"
+        dat_version = 0
+        if dat_path:
+            try:
+                with open(dat_path, "rb") as fh:
+                    sig = fh.read(4)
+                if sig[:4] == b"\x07\x08V1":
+                    dat_version = 1
+                elif sig[:4] == b"\x07\x08V2":
+                    dat_version = 2
+            except OSError:
+                dat_version = 0
+        if dat_version == 1:
+            decodable += 1
+        images.append(
+            {
+                "id": r["id"],
+                "time": _ts_to_str(r["create_time"]),
+                "sender_name": r["sender_name"] or r["sender_username"],
+                "content": r["content"],
+                "dat_path": dat_path,
+                "dat_exists": bool(dat_path) and Path(dat_path).is_file(),
+                "dat_version": dat_version,
+                "dat_decodable": dat_version == 1,
+                "dat_match": dat_match,
+            }
+        )
+
+    return {
+        "session_id": session_id,
+        "chat_hash": chash,
+        "total": total,
+        "returned": len(images),
+        "decodable": decodable,
+        "pending_key": len(images) - decodable,
+        "images": images,
+    }
+
+
+@mcp.tool()
+@_db_tool
+def find_message_covers(
+    session_id: str,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    limit: int = 60,
+    offset: int = 0,
+) -> Dict[str, Any]:
+    """定位某会话里消息附带的**封面图**（真实、未加密、可直接渲染）。
+
+    绿泡泡会把消息附带的封面图缓存成本机真实 JPEG::
+
+        cache/{YYYY-MM}/Message/{md5(username)}/Thumb/{序号}_{unix秒}_thumb.jpg
+
+    实测 chat_hash == md5(username)（104/104 命中），且文件名里的 unix 秒与
+    消息 create_time **精确相等**（5/5、4/4、1/1 零误差）。
+
+    注意：这里拿到的是 **appmsg 封面图**，不是 [图片] 消息的原图。实测
+    844 个缓存封面里 637 个属于链接卡片、62 个属于视频号，只有 1 个属于图片
+    消息。所以本工具按「消息 → 封面」返回，交给 <img src> 渲染聊天气泡的
+    链接/视频号/位置卡片缩略图；图片消息的原图请用 find_message_images。
+
+    Args:
+        session_id: 会话 username（群为 xxx@chatroom）
+        start: 可选，起始时间 YYYY-MM-DD [HH:MM[:SS]]
+        end: 可选，结束时间；只给日期时自动覆盖当天全天
+        limit: 返回条数，默认 60
+        offset: 分页偏移，默认 0
+
+    Returns:
+        {session_id, chat_hash, scanned, renderable, covers:[{time, sender_name,
+         content, tag, cover_path, cover_exists}]}。
+    """
+    err = _check_db_initialized()
+    if err:
+        return {"error": err}
+
+    files_root = get_files_root()
+    if not files_root:
+        return {"error": "未定位到绿泡泡文件根目录，无法查找封面缓存"}
+
+    conn = get_connection()
+    cur = conn.cursor()
+
+    where = ["m.session_username = ?"]
+    params: List[Any] = [session_id]
+    if start and end:
+        try:
+            start_ts, end_ts = _time_range_to_ts(cur, start, end)
+        except ValueError as exc:
+            conn.close()
+            return {"error": str(exc)}
+        where.append("m.create_time >= ? AND m.create_time < ?")
+        params.extend([start_ts, end_ts])
+
+    base_sql = (
+        "FROM messages m LEFT JOIN contacts c ON c.username = m.sender_username "
+        "WHERE " + " AND ".join(where)
+    )
+    total = cur.execute("SELECT COUNT(*) " + base_sql, params).fetchone()[0] or 0
+    rows = cur.execute(
+        "SELECT m.id, m.sender_username, c.display_name AS sender_name, "
+        "m.create_time, m.content "
+        + base_sql
+        + " ORDER BY m.create_time ASC LIMIT ? OFFSET ?",
+        params + [_clamp(limit, 60, 300), _safe_offset(offset)],
+    ).fetchall()
+    conn.close()
+
+    covers: List[Dict[str, Any]] = []
+    renderable = 0
+    for r in rows:
+        ts = int(_normalize_ts(r["create_time"]))
+        p = thumb_path_for(files_root, session_id, ts) if ts else ""
+        if not (p and Path(p).is_file()):
+            continue
+        renderable += 1
+        content = r["content"] or ""
+        covers.append(
+            {
+                "id": r["id"],
+                "time": _ts_to_str(r["create_time"]),
+                "sender_name": r["sender_name"] or r["sender_username"],
+                "content": content[:80],
+                "tag": re.match(r"^\[([^\]]+)\]", content).group(1) if re.match(r"^\[([^\]]+)\]", content) else "",
+                "cover_path": p,
+                "cover_exists": True,
+            }
+        )
+
+    return {
+        "session_id": session_id,
+        "chat_hash": chat_hash_of(session_id),
+        "scanned": len(rows),
+        "total_in_range": total,
+        "renderable": renderable,
+        "covers": covers,
+    }
+
+
+@mcp.tool()
+def read_media_data_url(path: str, aes_key: Optional[str] = None) -> Dict[str, Any]:
+    """把磁盘上的媒体文件读成可直接放进 <img src> 的 data URL。
+
+    真实图片（png / jpg / gif / webp / bmp）直接 base64 返回；
+    绿泡泡 .dat 容器按 [15字节头][AES-ECB段][16字节固定标记][单字节XOR段] 解码：
+
+      * V1 的 AES 密钥是硬编码常量，可完全离线解码；
+      * V2 的 AES 密钥是账号级密钥，需从运行中的绿泡泡进程提取；
+      * XOR 段密钥对 _t 缩略图可由文件尾 FF D9 反推（本机恒为 0x2E）。
+
+    缺少 V2 密钥时返回 need_key=true 而不报错，便于调用方引导用户。
+
+    安全边界：只允许读取 ``get_files_root()`` 目录下的文件；未配置该目录时
+    直接拒绝，避免本工具退化成任意文件读取器。
+
+    Args:
+        path: 文件绝对路径（来自 find_message_images / search_media_files）
+        aes_key: 可选，V2 .dat 的账号 AES 密钥（16 字节 ASCII 字符串）
+
+    Returns:
+        {ok, source, mime, bytes, data_url, header, xor_key}；
+        失败时 {ok: False, need_key?, error}。
+    """
+    root = get_files_root()
+    if not root:
+        return {
+            "ok": False,
+            "error": "未配置绿泡泡文件目录（files_root），已拒绝按任意路径读取。",
+            "path": str(path),
+        }
+    return _read_media_data_url(path, aes_key=aes_key, allowed_root=str(root))
+
 
 @mcp.tool()
 @_db_tool

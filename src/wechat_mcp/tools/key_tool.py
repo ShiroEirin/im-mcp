@@ -930,6 +930,91 @@ def _decrypt_database(db_path: str, out_path: str, enc_key: bytes) -> bool:
     return True
 
 
+def _merge_encrypted_wal(db_path: str, wal_path: str, enc_key: bytes) -> int:
+    """把加密 WAL 的已提交帧解密后合并进已解密的数据库文件（等价于手动 checkpoint）。
+
+    WCDB / SQLCipher 的 WAL 帧头（24 字节）是明文，页数据与主库一样按 4096 字节页加密。
+    只解密 .db、完全忽略 -wal，会在 WAL 真的还压着未 checkpoint 的数据时丢消息，所以这里
+    显式合并；但 WeChat 的 WCDB 也会对主库做 checkpoint 而不重置 WAL，此时残留的 WAL
+    记录的是更早的库状态（实测 message_0.db 的 WAL 记录 47724 页，而主库文件已有 50215
+    页），直接套用会把库回退成旧状态。因此做三重保护：
+
+    1. WAL 最后一个提交帧记录的库大小不得小于主库文件页数，否则判定为过期残留，跳过；
+    2. 只应用最后一个「提交帧」及其之前的帧（未提交尾部丢弃），与 SQLite 恢复语义一致；
+    3. 合并后做一次 ``quick_check`` 结构校验，不通过则由调用方回退为仅解密数据库本体。
+
+    返回应用的帧数；0 表示没有可用帧或判定为过期；-1 表示合并后校验失败（需回退）。
+    """
+    if not os.path.isfile(wal_path):
+        return 0
+    try:
+        if os.path.getsize(wal_path) <= 32:
+            return 0
+        with open(wal_path, "rb") as f:
+            data = f.read()
+    except OSError as exc:
+        logger.warning(f"读取 WAL 失败，跳过合并: {exc}")
+        return 0
+
+    frame_size = 24 + PAGE_SZ
+    pages: list[tuple[int, bytes]] = []
+    last_commit = -1
+    committed_pages = 0
+    for offset in range(32, len(data), frame_size):
+        frame = data[offset:offset + frame_size]
+        if len(frame) < frame_size:
+            break
+        pgno = struct.unpack(">I", frame[0:4])[0]
+        db_size = struct.unpack(">I", frame[4:8])[0]
+        if pgno == 0:
+            continue
+        pages.append((pgno, _decrypt_page(enc_key, frame[24:], pgno)))
+        if db_size:
+            last_commit = len(pages) - 1
+            committed_pages = db_size
+    if last_commit < 0 or committed_pages <= 0:
+        return 0
+
+    try:
+        db_pages = os.path.getsize(db_path) // PAGE_SZ
+    except OSError:
+        return 0
+    if committed_pages < db_pages:
+        logger.info(
+            f"WAL 记录 {committed_pages} 页 < 数据库文件 {db_pages} 页，"
+            f"判定为已 checkpoint 的过期残留，未合并: {wal_path}"
+        )
+        return 0
+
+    applied = pages[: last_commit + 1]
+    try:
+        with open(db_path, "r+b") as f:
+            for pgno, page in applied:
+                f.seek((pgno - 1) * PAGE_SZ)
+                f.write(page)
+    except OSError as exc:
+        logger.warning(f"合并 WAL 到数据库失败: {exc}")
+        return 0
+    if not _db_quick_check(db_path):
+        # 合并结果不合法（帧被误读 / WAL 与主库不同代），交给调用方回退
+        return -1
+    return len(applied)
+
+
+def _db_quick_check(path: str) -> bool:
+    """结构校验：确认解密（可能已合并 WAL）后的文件确实是一个可读的 SQLite 库。"""
+    try:
+        import sqlite3
+
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            return conn.execute("PRAGMA quick_check(1)").fetchone()[0] == "ok"
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def decrypt_all(db_dir: str, out_dir: str, keys_file: str) -> dict:
     _print("=" * 60)
     _print("  WeChat 数据库解密器 (Windows)")
@@ -967,6 +1052,13 @@ def decrypt_all(db_dir: str, out_dir: str, keys_file: str) -> dict:
         out_path = os.path.join(out_dir, rel)
         _print(f"解密: {rel} ({sz / 1024 / 1024:.1f}MB) ...", end=" ")
         if _decrypt_database(path, out_path, enc_key):
+            wal_frames = _merge_encrypted_wal(out_path, path + "-wal", enc_key)
+            if wal_frames < 0:
+                logger.warning(f"合并 WAL 后校验未通过，已回退为仅解密数据库本体: {rel}")
+                _decrypt_database(path, out_path, enc_key)
+                wal_frames = 0
+            if wal_frames:
+                _print(f"  [+] 已合并 WAL 已提交帧: {wal_frames}")
             try:
                 import sqlite3
                 conn = sqlite3.connect(out_path)

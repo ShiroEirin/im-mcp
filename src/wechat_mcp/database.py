@@ -145,7 +145,7 @@ def init_schema():
 
 # ETL 解析/中间库结构版本号。解析逻辑或表结构变化时必须递增，
 # 否则老用户升级后源库文件未变 -> 指纹一致 -> 直接 skipped，新逻辑永不生效。
-ETL_SCHEMA_VERSION = "3"
+ETL_SCHEMA_VERSION = "4"
 
 
 def compute_fingerprint(decrypted_dir: Path) -> str:
@@ -171,6 +171,10 @@ def _collect_stats(cur: sqlite3.Cursor) -> dict:
         "contacts": count("contacts"),
         "sessions": count("sessions"),
         "messages": count("messages"),
+        "chatroom_members": count("chatroom_members"),
+        "media_files": count("media_files"),
+        "favorites": count("favorites"),
+        "emoticons": count("emoticons"),
     }
 
 

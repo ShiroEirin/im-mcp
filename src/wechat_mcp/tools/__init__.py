@@ -13,7 +13,7 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-from .key_tool import main as key_tool_main, auto_detect_db_dir, cmd_extract
+from .key_tool import cmd_extract
 from ..database import sync_data
 from ..config import DEFAULT_DECRYPTED_DIR, USER_WECHAT_DIR
 

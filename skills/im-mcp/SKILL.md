@@ -87,6 +87,38 @@ dingtalk-init
          > 💡 **“我已在后台开启密钥监听。请在 Mac 微信主界面操作：点击左下角「设置」->「账号与存储」->「退出登录」（注意是退出当前账号，切勿使用 Cmd+Q 退出整个微信软件），然后掏出手机重新扫码登录。登录完成后请回复我，我为您检查并完成解密！”**
       3. **等待用户确认**：用户回复已重新扫码登录后，检查 `/tmp/wechat-init.log` 验证 passphrase 捕获与解密。
       4. **进程漂移与容错保障**：底层已内置 PID 自动巡检（若用户不慎重启导致 PID 变更会精准提醒）、常驻 stdin 保活（后台启动绝不因 EOF 退出）以及优雅退出保护（绝不误杀微信）。
+  - **⚠️ 智能体绝对禁令：严禁手动清理 lldb / debugserver 进程（真机实测血泪教训）**
+    本节为 macOS 调试子系统的高危操作区，智能体必须严格遵守以下规则，否则会**直接杀死用户的微信进程**：
+
+    | 操作 | 后果（真机实验结论） |
+    | :--- | :--- |
+    | `kill -TERM <debugserver pid>` | ❌ **微信立即被连带 SIGKILL 强杀** |
+    | `kill -9 <debugserver pid>` | ❌ **微信立即被连带 SIGKILL 强杀** |
+    | `pkill -f "LLDB.framework.*debugserver"` | ❌ **微信立即被连带 SIGKILL 强杀**（`-TERM` 也会！） |
+    | `kill -TERM <lldb 前端 pid>` | ✅ 安全，tracee 存活 |
+    | `kill -9 <lldb 前端 pid>` | ✅ 安全，tracee 存活 |
+
+    **核心结论**：
+    - **向 debugserver 发送任何信号（无论 SIGTERM 还是 SIGKILL）都会导致 macOS 调试子系统连带 SIGKILL 掉 tracee（微信）。** 历史注释只警告了 `-9`，但 `-TERM` 同样致命。
+    - **唯一安全的清理对象是 lldb 前端进程**，因为它退出时会自行优雅关闭 debugserver。
+    - 因此 `wechat-init` 的 `_cleanup_lldb_orphans_macos()` **已刻意完全不触碰 debugserver**，并且在 tracee 仍存活时**直接跳过所有清理**。
+
+    **智能体行为要求**：
+    1. **禁止**在 `wechat-init` 运行期间或刚结束后，自行执行 `pkill lldb`、`pkill debugserver`、`kill -9` 等任何清理命令；
+    2. **禁止**为了“清理环境”而提前终止 lldb —— 必须等 `wechat-init` 主进程自行退出（`pgrep -f bin/wechat-init` 为空）后再做任何判断；
+    3. 若发现残留 lldb 孤儿进程，**默认保持不动**。它只是惰性进程，不影响微信使用；如确需清理，仅可执行 `pkill -x lldb`（**绝不加 `-9`，绝不针对 debugserver**），且必须先确认用户已退出微信或明确授权；
+    4. 若微信界面“意外消失”，先查证再下结论：
+       ```bash
+       # 判断是否为 SIGKILL 强杀（第 3 个字段为 9）
+       log show --last 10m --predicate 'eventMessage CONTAINS "WeChat"' --style compact | grep "termination reported"
+       ```
+       `termination reported by launchd (2, 9, 9)` 表示 **SIGKILL 强杀**，且**不会产生崩溃报告**（`SIGKILL` 无法被捕获）。切勿把“无崩溃报告”误判为“未崩溃”。
+  - **⚠️ 断点冻结防护机制（已内置，智能体无需干预）**：
+    历史上 `wechat-init` 存在两个会导致微信卡死/崩溃的缺陷，现已修复：
+    1. **断点冻结**：旧实现用 lldb 命令块执行 `memory read` + `process continue`。因 lldb 默认 `stop-command-source-on-error=true`，一旦 `memory read` 失败（微信在独立线程调用 PBKDF2，`$rsi` 指向栈上临时缓冲区），会中止命令块剩余命令，导致 `process continue` 永不执行，微信被永久冻结。**现改为 Python 断点回调 + `try/finally` 无条件 `proc.Continue()`**，并叠加 12 秒冻结看门狗。
+    2. **收尾竞争**：旧实现在 lldb detach 尚未完成时就 `pkill`，会让 tracee 停在断点指令（`int3`）上并触发 `EXC_BREAKPOINT/SIGTRAP` 崩溃。**现改为 `_wait_lldb_exit()` 确认 detach 完成后再清理，并先 `_resume_tracee_if_stopped()` 恢复暂停态**。
+    智能体遇到上述报错时应**直接重试或改用 `--passphrase`**，切勿自行修改源码或手动干预进程。
+  - **稳定性验证结论（可复用）**：同一微信账号在同一台机器上，多次重新登录捕获到的 **passphrase 恒定不变**（实测 4 次完全一致）。因此**无需反复让用户退出登录来“验证稳定性”**：只要一次捕获通过 HMAC 自证（日志出现 `passphrase 捕获并自证通过`），即可确认成功并进入解密流程。**反复要求用户退出/登录微信存在账号风控风险，必须避免。**
   - **手动传参降级**：若用户已有 64 位十六进制 passphrase，支持直接传入跳过断点捕获：
     ```bash
     wechat-init --passphrase <64位十六进制passphrase>

@@ -61,7 +61,45 @@
 - **依赖锁定**：`uv.lock` 与 `pyproject.toml` 版本对齐（原先 `uv lock --check`
   直接报错：lockfile needs to be updated）。
 
+## macOS 微信 4.1+ 密钥捕获（lldb）稳定性修复
+
+以下两个缺陷均会导致**用户微信进程被冻结或强杀**，已在真机（macOS 12.6 x86_64，
+微信 4.1.15）复现并修复：
+
+- **断点命中后进程冻结**：原实现把 `memory read` + `process continue` 写成 lldb
+  断点命令块。lldb 默认 `stop-command-source-on-error=true`，而微信在独立工作线程
+  调用 `CCKeyDerivationPBKDF`，`$rsi` 指向栈上临时缓冲区，命中瞬间 `memory read`
+  可能失败；一旦失败，lldb 会中止命令块剩余命令，导致末尾的 `process continue`
+  永不执行，微信被永久冻结在断点上（实测进程状态 `SX` 且 CPU 时间零增长）。
+  改为 **Python 断点回调 + `try/finally` 无条件 `proc.Continue()`**，并叠加 12 秒
+  冻结看门狗（回调失效时自动 detach 解冻）。
+  附注：`settings set interpreter.stop-command-source-on-error false` 对断点命令块
+  无效；在命令块内用 `-s python` 也无法注册回调，必须用独立 `.py` 文件 + `-F`。
+- **收尾阶段强杀微信（关键）**：原 `_cleanup_lldb_orphans_macos()` 会执行
+  `pkill -TERM -f "LLDB.framework.*debugserver"`。真机隔离实验证明：**向 debugserver
+  发送任何信号（SIGTERM 或 SIGKILL）都会使 macOS 调试子系统连带把 tracee（微信）
+  SIGKILL 强杀**（现象：`runningboardd` 记录 `termination reported by launchd (2, 9, 9)`，
+  且因 SIGKILL 不可捕获而**不产生崩溃报告**）。原注释只警告了 `-9`，实际 `-TERM`
+  同样致命。
+  现改为：**完全不触碰 debugserver**，仅在 tracee 已不存在时才向孤立 lldb 前端
+  发送 SIGTERM，且永不使用 SIGKILL；tracee 存活时直接跳过全部清理。
+  另新增 `_wait_lldb_exit()`（确认 detach 完成后再清理）与
+  `_resume_tracee_if_stopped()`（清理前恢复暂停态，避免停在 `int3` 上触发
+  `EXC_BREAKPOINT/SIGTRAP`）。
+- **稳定性结论**：同一账号在同一机器上多次重新登录，捕获到的 passphrase 恒定不变
+  （实测 4 次完全一致，均为同一 64 位十六进制值）。因此一次捕获通过 HMAC 自证即可
+  确认成功，**无需反复让用户退出/登录微信**（反复登录存在账号风控风险）。
+
 ## 文档
 
 - `README.md` 与 `skills/im-mcp/SKILL.md` 补齐全部工具、参数与 CLI 说明，修正
   DuangDuang 侧工具名与参数名。
+- `skills/im-mcp/SKILL.md` 新增 **「智能体绝对禁令：严禁手动清理 lldb / debugserver」**
+  一节，以真机实验表格形式列明哪些信号会连带杀死微信、哪些操作安全，并规定：
+  - 禁止在 `wechat-init` 运行期间或刚结束后自行 `pkill` / `kill -9` 调试器进程；
+  - 必须等 `wechat-init` 主进程自行退出后再做任何判断；
+  - 残留 lldb 孤儿进程默认保持不动（惰性无害）；确需清理只能 `pkill -x lldb`；
+  - 微信“意外消失”时用 `log show ... | grep "termination reported"` 判断是否为
+    SIGKILL，切勿把“无崩溃报告”误判为“未崩溃”；
+  - **禁止反复要求用户退出/登录微信来“验证稳定性”**（一次 HMAC 自证通过即足够，
+    反复登录有账号风控风险）。

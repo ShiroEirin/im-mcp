@@ -38,6 +38,7 @@ import os
 import re
 import select
 import shutil
+import signal
 import struct
 import subprocess
 import sys
@@ -778,22 +779,107 @@ def _find_wechat_pid_macos() -> int | None:
         return None
 
 
-def _cleanup_lldb_orphans_macos() -> None:
-    # 绝不能对 LLDB.framework.*debugserver 使用 SIGKILL (-9)！
-    # macOS 调试子系统既定行为：debugserver 被 SIGKILL 时其 tracee（微信）会被系统连带 SIGKILL 强杀。
-    # 优先使用 SIGTERM 优雅退出；先通知 lldb，再通知 debugserver
-    for pat in (["pkill", "-TERM", "-x", "lldb"],
-                ["pkill", "-TERM", "-f", "LLDB.framework.*debugserver"]):
+def _cleanup_lldb_orphans_macos(
+    keep_pids: "set[int] | None" = None,
+    tracee_pid: "int | None" = None,
+) -> None:
+    """清理残留的 lldb 进程。
+
+    ⚠️ 重大安全约束（经真机实验确认）：
+      向 LLDB.framework 的 debugserver 发送 ANY 信号（SIGTERM 或 SIGKILL）
+      都会使 macOS 调试子系统连带把 tracee（微信）SIGKILL 强杀！
+      实验证据：kill -TERM debugserver → tracee 立即 "Killed: 9"。
+      因此本函数 **绝不触碰 debugserver**，无论信号强弱。
+
+    只清理孤立的 lldb 前端进程（它们退出时会自行关闭 debugserver）。
+    若 tracee 仍存活，则完全不清理，宁肯留下惰性孤儿进程。
+    """
+    if tracee_pid:
+        _resume_tracee_if_stopped(tracee_pid)
+
+    def _alive(p: int) -> bool:
         try:
-            subprocess.run(pat, capture_output=True, timeout=3)
-        except Exception:
-            pass
-    # 等待片刻，若 lldb 仍有残留，仅对 lldb 进程进行 -9，但绝不 -9 debugserver
+            os.kill(p, 0)
+            return True
+        except OSError:
+            return False
+
+    # 硬性安全阀：tracee 存活时绝不做任何清理动作。
+    if tracee_pid and _alive(tracee_pid):
+        return
+
+    protected = {p for p in (keep_pids or set()) if p and _alive(p)}
+
+    # 仅向孤立的 lldb 前端发 SIGTERM；绝不使用 -9，绝不触碰 debugserver。
     try:
-        time.sleep(0.5)
-        subprocess.run(["pkill", "-9", "-x", "lldb"], capture_output=True, timeout=2)
+        r = subprocess.run(["pgrep", "-x", "lldb"], capture_output=True, text=True, timeout=3)
+        for tok in r.stdout.split():
+            if tok.isdigit() and int(tok) not in protected:
+                try:
+                    os.kill(int(tok), signal.SIGTERM)
+                except OSError:
+                    pass
     except Exception:
         pass
+
+    # 刻意不做 SIGKILL 兜底，也不清理 debugserver：
+    # 残留的 lldb 只是惰性孤儿进程，不会伤害微信；清理它的收益远小于杀掉微信的风险。
+    # 用户可随时手动结束，因此宁可不清理也不冒杀微信的风险。
+    return
+
+
+def _resume_tracee_if_stopped(tracee_pid: int) -> bool:
+    """若 tracee 仍被调试器暂停，发 SIGCONT 使其继续运行，避免停在断点上崩溃。
+
+    返回 True 表示确认进程处于运行态（或已不存在），False 表示仍无法恢复。
+    """
+    for _ in range(20):
+        if not _pid_alive(tracee_pid):
+            return True
+        try:
+            # macOS 无 /proc，用 ps 取 STAT 列判断是否处于 stopped / traced-stopped
+            r = subprocess.run(
+                ["ps", "-o", "stat=", "-p", str(tracee_pid)],
+                capture_output=True, text=True, timeout=3,
+            )
+            stat = (r.stdout or "").strip()
+        except Exception:
+            return True
+        if not stat:
+            return True
+        # T = stopped，X = traced；组合 "SX"/"TX"/"RX" 表示被调试器跟踪但未必停住，
+        # 关键看是否有 T（真正 stopped）。
+        if "T" not in stat:
+            return True
+        try:
+            os.kill(tracee_pid, signal.SIGCONT)
+        except OSError:
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _wait_lldb_exit(proc: "subprocess.Popen | None", timeout: float = 8.0) -> bool:
+    """等待 lldb 进程（含其管道包装）彻底退出，确保 detach 完成后再做清理。
+
+    返回 True 表示已退出。
+    """
+    if proc is None:
+        return True
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            return True
+        time.sleep(0.1)
+    return proc.poll() is not None
 
 
 def _parse_lldb_passphrase(out: str) -> str | None:
@@ -838,17 +924,75 @@ def capture_passphrase_lldb(
         bp_cond = "$rdx == 32 && $rdi == 2 && $r8 == 16"
         pw_reg = "rsi"
 
-    # 在断点 command 中打标记，方便流式切分多个候选
+    # 关键修复（防卡死）：旧实现把读取逻辑写成 lldb 断点命令块：
+    #   memory read ... / process continue
+    # 但 lldb 默认 stop-command-source-on-error=true，一旦 memory read 失败
+    # （微信在独立线程调用 PBKDF2，$rsi 指向栈上临时缓冲区，命中瞬间可能读取失败），
+    # lldb 会中止命令块剩余命令，导致末尾的 `process continue` 永远不执行 ——
+    # 微信进程被永久冻结在断点上。
+    # 因此改为 Python 回调：所有读取都包在 try/except 中，并在 finally 中无条件
+    # 调用 process.Continue()，保证无论读取成功与否都会放行目标进程。
+    hook_src = f'''import lldb
+
+_PW_REG = "{pw_reg}"
+
+
+def _hexify(data):
+    try:
+        return " ".join("0x%02x" % b for b in bytes(data))
+    except Exception:
+        pass
+    try:
+        err = lldb.SBError()
+        return " ".join("0x%02x" % data.GetUnsignedInt8(err, i) for i in range(32))
+    except Exception:
+        return ""
+
+
+def pbkdf_hook(frame, bp_loc, internal_dict):
+    proc = frame.GetThread().GetProcess()
+    try:
+        addr = 0
+        try:
+            addr = frame.FindRegister(_PW_REG).GetValueAsUnsigned()
+        except Exception as e:
+            print("=== HOOK_REG_ERR %s ===" % e)
+        data = None
+        if addr:
+            err = lldb.SBError()
+            data = proc.ReadMemory(addr, 32, err)
+            if not err.Success():
+                data = None
+        if data is not None:
+            hexs = _hexify(data)
+            if hexs:
+                print("=== CANDIDATE_START ===")
+                print("0x%016x: %s" % (addr, hexs))
+                print("=== CANDIDATE_END ===")
+            else:
+                print("=== HOOK_READ_EMPTY ===")
+        else:
+            print("=== HOOK_READ_FAILED addr=0x%x ===" % addr)
+    except Exception as e:
+        print("=== HOOK_ERR %s ===" % e)
+    finally:
+        # 无条件放行，杜绝把微信冻在断点上
+        try:
+            proc.Continue()
+        except Exception:
+            pass
+    return False
+'''
+    fd_h, hook_path = tempfile.mkstemp(suffix=".py", prefix="wxhook_")
+    with os.fdopen(fd_h, "w") as f:
+        f.write(hook_src)
+
     script = (
         "settings set target.preload-symbols false\n"
+        f"command script import {hook_path}\n"
         f"process attach -p {target_pid}\n"
         f"breakpoint set -n CCKeyDerivationPBKDF -c '{bp_cond}'\n"
-        "breakpoint command add 1\n"
-        "script print('=== CANDIDATE_START ===')\n"
-        f"memory read --size 1 --count 32 --format x ${pw_reg}\n"
-        "script print('=== CANDIDATE_END ===')\n"
-        "process continue\n"
-        "DONE\n"
+        "breakpoint command add 1 -F " + os.path.basename(hook_path)[:-3] + ".pbkdf_hook\n"
         "process continue\n"
     )
     fd, sp = tempfile.mkstemp(suffix=".lldb", prefix="wxcap_")
@@ -871,6 +1015,10 @@ def capture_passphrase_lldb(
     last_check_pid_time = time.time()
     seen_candidates: set[str] = set()
     verified_passphrase: str | None = None
+    # 冻结看门狗：若断点命中后 12 秒内既没有 resuming 也没有候选输出，
+    # 说明回调未生效（如 import 失败），立即强制 detach 解冻，避免微信卡死。
+    bp_stop_seen_at: float | None = None
+    FREEZE_GUARD_SECONDS = 12.0
 
     try:
         while deadline is None or time.time() < deadline:
@@ -882,6 +1030,11 @@ def capture_passphrase_lldb(
                         break
                     continue
                 buf += line
+
+                if "stop reason = breakpoint" in line:
+                    bp_stop_seen_at = time.time()
+                elif "resuming" in line or "CANDIDATE_START" in line:
+                    bp_stop_seen_at = None
 
                 # 流式解析 CANDIDATE
                 while "=== CANDIDATE_START ===" in buf and "=== CANDIDATE_END ===" in buf:
@@ -906,6 +1059,14 @@ def capture_passphrase_lldb(
 
                 if verified_passphrase:
                     break
+
+            # 冻结看门狗
+            if bp_stop_seen_at is not None and (time.time() - bp_stop_seen_at) > FREEZE_GUARD_SECONDS:
+                logger.error("断点命中后进程未自动恢复，正在强制 detach 解冻...")
+                raise LLDBPassphraseCaptureError(
+                    "断点命中后微信进程未能自动恢复，已强制 detach 解冻（微信应已恢复正常使用）。\n"
+                    "这通常意味着断点回调未生效。请重试，或改用 --passphrase 手动传入口令。"
+                )
 
             # 进程漂移容错：每隔 2 秒检查目标微信进程是否仍然存活
             now = time.time()
@@ -935,11 +1096,17 @@ def capture_passphrase_lldb(
                 proc.kill()
             except Exception:
                 pass
-        try:
-            os.unlink(sp)
-        except OSError:
-            pass
-        _cleanup_lldb_orphans_macos()
+        # 关键顺序：先等 lldb 真正退出（完成 detach），再动 tracee 与残留进程。
+        # 旧实现直接 pkill，若与 detach 收尾竞争，会让 tracee 停在断点指令上
+        # 并触发 EXC_BREAKPOINT/SIGTRAP 崩溃。
+        _wait_lldb_exit(proc, timeout=8.0)
+        _resume_tracee_if_stopped(target_pid)
+        for _tmp in (sp, hook_path):
+            try:
+                os.unlink(_tmp)
+            except OSError:
+                pass
+        _cleanup_lldb_orphans_macos(tracee_pid=target_pid)
 
     if verified_passphrase:
         logger.info("LLDB passphrase 捕获并确认成功")

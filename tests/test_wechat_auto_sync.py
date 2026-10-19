@@ -4,6 +4,7 @@
 """
 
 import json
+import os
 import tempfile
 import time
 import unittest
@@ -213,34 +214,52 @@ class TestAutoSyncState(unittest.TestCase):
         self.assertIn("last_run", saved)
 
 
-class _FakeAliveThread:
-    """只用于冒充「仍在运行的同步线程」——不需要真的起线程。"""
+class _FakeProc:
+    """冒充 spawn 出来的独立同步进程。"""
 
-    def is_alive(self):
-        return True
+    pid = 424242
 
 
 class TestManualSyncWorker(unittest.TestCase):
-    """手动后台同步（start_sync / _sync_worker）的两条关键不变量。
+    """手动同步（start_sync / _sync_worker / 独立进程心跳）的关键不变量。
 
-    真实故障（2026-10-19 实测）：面板点「同步微信数据」永远停在「同步中」。
-    根因有二 —— (1) 后台线程抛异常时只 logger.warning 不写 state，调用方按
-    run_count 增长判定完成的条件永远不成立；(2) start_sync 只检查 is_alive()，
-    一次卡死之后每次点击都返回 already_running，永久卡死。
+    真实故障（2026-10-19 实测）：面板点「同步微信数据」永远停在「同步中」。两个根因 ——
+    (1) 后台线程抛异常时只 logger.warning 不写 state，调用方按 run_count 增长判定完成的
+    条件永远不成立；(2) 宿主（Snow App）对 stdio MCP 是**短连接**（每次工具调用 spawn
+    进程、寿命 < 1 秒），进程内的后台线程会随进程被杀，而一次完整同步实测 53 秒 ——
+    永远跑不完。因此 start_sync 必须把同步交给**脱离进程树**的独立进程，并用文件心跳
+    报告进度；进程内线程只作为 spawn 受限环境的兜底。
     """
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.state = Path(self._tmp.name) / "auto_sync.json"
+        self.sync_state = Path(self._tmp.name) / "sync_state.json"
         self._patch = patch.object(auto_sync, "STATE_FILE", self.state)
         self._patch.start()
+        self._patch_sync = patch.object(auto_sync, "SYNC_STATE_FILE", self.sync_state)
+        self._patch_sync.start()
 
     def tearDown(self):
         self._patch.stop()
+        self._patch_sync.stop()
         self._tmp.cleanup()
         with auto_sync._lock:
             auto_sync._sync_thread = None
             auto_sync._sync_started_at = None
+
+    def _write_sync_state(self, **overrides):
+        payload = {
+            "mode": "detached",
+            "pid": os.getpid(),  # 用当前进程冒充「还活着」
+            "started_at": time.time() - 10,
+            "heartbeat_at": time.time(),
+        }
+        payload.update(overrides)
+        self.sync_state.write_text(json.dumps(payload), encoding="utf-8")
+        return payload
+
+    # ---- 进程内线程兜底路径 ----
 
     def test_worker_records_failure_when_sync_raises(self):
         """异常必须落盘：否则调用方永远等不到「跑完」的信号。"""
@@ -255,33 +274,98 @@ class TestManualSyncWorker(unittest.TestCase):
         self.assertIsNone(auto_sync._sync_thread)
         self.assertIsNone(auto_sync._sync_started_at)
 
-    def test_start_sync_reports_already_running_when_fresh(self):
-        """未超时阈值的同步在跑：必须如实报告 already_running 与已跑时长。"""
-        with auto_sync._lock:
-            auto_sync._sync_thread = _FakeAliveThread()
-            auto_sync._sync_started_at = time.time() - 5
+    # ---- 独立进程路径 ----
 
-        res = auto_sync.start_sync()
+    def test_start_sync_spawns_detached_worker(self):
+        """默认走独立进程（脱离进程树），并如实报告 mode / pid。"""
+        with patch.object(auto_sync, "_spawn_detached_worker", return_value=_FakeProc()):
+            res = auto_sync.start_sync()
+        self.assertTrue(res["started"])
+        self.assertEqual(res["mode"], "detached")
+        self.assertEqual(res["pid"], _FakeProc.pid)
+
+    def test_start_sync_falls_back_to_thread_when_spawn_fails(self):
+        """spawn 受限（沙箱 / 受限客户端）时必须回退线程，而不是直接失败。"""
+        with patch.object(auto_sync, "_spawn_detached_worker", return_value=None), \
+             patch.object(auto_sync, "_sync_worker"):
+            res = auto_sync.start_sync()
+        self.assertTrue(res["started"])
+        self.assertEqual(res["mode"], "thread")
+        self.assertIn("短连接", res["note"])
+
+    # ---- 文件心跳判定 ----
+
+    def test_heartbeat_fresh_means_running(self):
+        """心跳新鲜且进程存活 → syncing true，并给出模式与已跑时长。"""
+        self._write_sync_state()
+        st = auto_sync.get_auto_sync_status()
+        self.assertTrue(st["syncing"])
+        self.assertEqual(st["sync_mode"], "detached")
+        self.assertGreaterEqual(st["sync_elapsed_seconds"], 10)
+
+    def test_stale_heartbeat_is_cleared_and_not_running(self):
+        """心跳过期（进程可能已被强杀）→ 不算在跑，并清掉残留状态。"""
+        self._write_sync_state(
+            started_at=time.time() - 600,
+            heartbeat_at=time.time() - (auto_sync.SYNC_HEARTBEAT_STALE_SECONDS + 5),
+        )
+        self.assertFalse(auto_sync.get_auto_sync_status()["syncing"])
+        self.assertFalse(self.sync_state.exists())
+
+    def test_dead_pid_is_cleared_and_not_running(self):
+        """心跳还新鲜但进程已不存在 → 立即判死（不必等心跳过期）。"""
+        self._write_sync_state(pid=999999)  # 基本不可能存在的 pid
+        self.assertFalse(auto_sync.get_auto_sync_status()["syncing"])
+        self.assertFalse(self.sync_state.exists())
+
+    def test_already_running_uses_file_heartbeat(self):
+        """已有独立进程在跑时，start_sync 必须返回 already_running 且不重复拉起。"""
+        self._write_sync_state(started_at=time.time() - 5, heartbeat_at=time.time())
+        with patch.object(auto_sync, "_spawn_detached_worker") as spawn:
+            res = auto_sync.start_sync()
         self.assertFalse(res["started"])
         self.assertTrue(res["already_running"])
         self.assertGreaterEqual(res["elapsed_seconds"], 5)
+        spawn.assert_not_called()
 
-        st = auto_sync.get_auto_sync_status()
-        self.assertTrue(st["syncing"])
-        self.assertIsNotNone(st["sync_started_at"])
-        self.assertGreaterEqual(st["sync_elapsed_seconds"], 5)
-
-    def test_start_sync_replaces_stale_thread(self):
-        """超过 SYNC_STALE_SECONDS 仍活着 → 视为僵死，必须允许重新发起。"""
-        with auto_sync._lock:
-            auto_sync._sync_thread = _FakeAliveThread()
-            auto_sync._sync_started_at = time.time() - (auto_sync.SYNC_STALE_SECONDS + 1)
-
-        with patch.object(auto_sync, "_sync_worker"):
+    def test_stale_file_heartbeat_allows_restart(self):
+        """心跳过期 → 允许重新发起（僵尸自愈），否则一次卡死会永久堵住后续调用。"""
+        self._write_sync_state(
+            started_at=time.time() - (auto_sync.SYNC_STALE_SECONDS + 10),
+            heartbeat_at=time.time() - (auto_sync.SYNC_HEARTBEAT_STALE_SECONDS + 10),
+        )
+        with patch.object(auto_sync, "_spawn_detached_worker", return_value=_FakeProc()):
             res = auto_sync.start_sync()
-
         self.assertTrue(res["started"])
         self.assertNotIn("already_running", res)
+
+    # ---- 独立进程本体 ----
+
+    def test_worker_run_records_result_and_clears_state(self):
+        """sync_worker.run 正常路径：写 last_run、run_count+1、清掉心跳、退出码 0。"""
+        from wechat_mcp import sync_worker
+
+        with patch.object(auto_sync, "refresh_and_sync", return_value={"ok": True}):
+            code = sync_worker.run(force=False, redecrypt=True)
+
+        self.assertEqual(code, 0)
+        saved = json.loads(self.state.read_text(encoding="utf-8"))
+        self.assertEqual(saved["run_count"], 1)
+        self.assertTrue(saved["last_run"]["ok"])
+        self.assertFalse(self.sync_state.exists())
+
+    def test_worker_run_records_exception_and_returns_nonzero(self):
+        """sync_worker.run 异常路径：异常也要落盘（调用方靠它判定「本轮结束」）。"""
+        from wechat_mcp import sync_worker
+
+        with patch.object(auto_sync, "refresh_and_sync", side_effect=RuntimeError("解密失败")):
+            code = sync_worker.run()
+
+        self.assertEqual(code, 1)
+        saved = json.loads(self.state.read_text(encoding="utf-8"))
+        self.assertFalse(saved["last_run"]["ok"])
+        self.assertIn("解密失败", saved["last_run"]["result"]["error"])
+        self.assertFalse(self.sync_state.exists())
 
 
 if __name__ == "__main__":

@@ -55,6 +55,11 @@ _sync_thread: Optional[threading.Thread] = None
 _sync_started_at: Optional[float] = None
 # 僵尸判定阈值：后台同步超过该时长仍未结束，视为卡死，允许重新发起（实测一次同步 1–3 分钟）
 SYNC_STALE_SECONDS = 20 * 60
+# 独立同步进程的心跳状态：单独一个文件，避免 MCP 进程与 worker 同时读改写 auto_sync.json 互相覆盖
+SYNC_STATE_FILE = USER_WECHAT_DIR / "sync_state.json"
+# 心跳写入间隔 / 心跳过期阈值（过期且进程已退出即视为僵死）
+SYNC_HEARTBEAT_SECONDS = 5
+SYNC_HEARTBEAT_STALE_SECONDS = 90
 _lock = threading.RLock()
 
 
@@ -178,19 +183,7 @@ def _run_once(force: bool = False) -> Dict[str, Any]:
     """跑一次并记录状态（定时器与手动同步共用）"""
     started = time.time()
     result = refresh_and_sync(force=force)
-    record = {
-        "at": int(time.time()),
-        "duration_seconds": round(time.time() - started, 1),
-        "ok": bool(result.get("ok")),
-        "result": result,
-    }
-    with _lock:
-        state = _load_state()
-        state["last_run"] = record
-        state["run_count"] = int(state.get("run_count", 0)) + 1
-        _save_state(state)
-    logger.info(f"同步完成 ok={record['ok']} 耗时 {record['duration_seconds']}s")
-    return record
+    return record_run(result, started)
 
 
 # ------------------------------------------------------------------
@@ -214,6 +207,110 @@ def _save_state(state: Dict[str, Any]) -> None:
         os.replace(tmp, STATE_FILE)
     except Exception as exc:  # noqa: BLE001
         logger.warning(f"写入定时同步状态失败：{exc}")
+
+
+def record_run(result: Dict[str, Any], started_at: float) -> Dict[str, Any]:
+    """把一次同步结果写入 auto_sync.json（独立进程与进程内线程共用）。"""
+    record = {
+        "at": int(time.time()),
+        "duration_seconds": round(time.time() - started_at, 1),
+        "ok": bool(result.get("ok")),
+        "result": result,
+    }
+    with _lock:
+        state = _load_state()
+        state["last_run"] = record
+        state["run_count"] = int(state.get("run_count", 0)) + 1
+        _save_state(state)
+    logger.info(f"同步完成 ok={record['ok']} 耗时 {record['duration_seconds']}s")
+    return record
+
+
+# ------------------------------------------------------------------
+# 3b) 独立同步进程的心跳状态
+# ------------------------------------------------------------------
+
+def _load_sync_state() -> Optional[Dict[str, Any]]:
+    """读独立同步进程写的心跳状态（不存在 / 损坏返回 None）。"""
+    try:
+        with open(SYNC_STATE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _save_sync_state(payload: Dict[str, Any]) -> None:
+    """原子写心跳状态（worker 独占写，其它进程只读）。"""
+    try:
+        SYNC_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = SYNC_STATE_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, SYNC_STATE_FILE)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"写入同步心跳状态失败：{exc}")
+
+
+def _clear_sync_state() -> None:
+    try:
+        SYNC_STATE_FILE.unlink()
+    except FileNotFoundError:
+        pass
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"清理同步心跳状态失败：{exc}")
+
+
+def _pid_alive(pid: Any) -> bool:
+    """判断进程是否存活（跨平台，不引入第三方依赖）。"""
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not handle:
+                return False
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return True
+        except Exception:  # noqa: BLE001 - 查询失败时保守认为存活，交给心跳超时兜底
+            return True
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    except Exception:  # noqa: BLE001
+        return True
+    return True
+
+
+def _active_sync() -> Optional[Dict[str, Any]]:
+    """返回仍在运行的同步记录（独立进程心跳优先，进程内线程兜底），无则 None。
+
+    副作用：判定为僵死时会顺手清掉心跳文件 —— 否则一次异常退出会让之后每次
+    start_sync 都误报 already_running。
+    """
+    st = _load_sync_state()
+    if st:
+        try:
+            fresh = (time.time() - float(st.get("heartbeat_at") or st.get("started_at") or 0)) <= SYNC_HEARTBEAT_STALE_SECONDS
+        except (TypeError, ValueError):
+            fresh = False
+        alive = _pid_alive(st.get("pid"))
+        if fresh and alive:
+            return st
+        logger.warning(
+            f"清理已结束/僵死的同步记录（pid={st.get('pid')} fresh={fresh} alive={alive}）"
+        )
+        _clear_sync_state()
+    with _lock:
+        if _sync_thread is not None and _sync_thread.is_alive():
+            return {
+                "mode": "thread",
+                "pid": os.getpid(),
+                "started_at": _sync_started_at or time.time(),
+            }
+    return None
 
 
 # ------------------------------------------------------------------
@@ -287,43 +384,34 @@ def set_auto_sync(enabled: bool, interval_minutes: Optional[int] = None) -> Dict
 def get_auto_sync_status() -> Dict[str, Any]:
     """查询定时同步状态（含上次运行结果）"""
     state = _load_state()
-    with _lock:
-        last = state.get("last_run")
-        syncing = bool(_sync_thread is not None and _sync_thread.is_alive())
-        started = _sync_started_at if syncing else None
+    active = _active_sync() or {}
+    started = float(active.get("started_at") or 0)
     return {
         "enabled": bool(state.get("enabled")),
         "running": bool(_worker is not None and _worker.is_alive()),
-        "syncing": syncing,
-        # 让调用方能判断「这次同步已经跑了多久」，从而区分「正常在跑」与「卡死」
+        "syncing": bool(active),
+        # 独立进程与进程内线程都走这条路径：调用方据此区分「正常在跑」与「卡死」
+        "sync_mode": active.get("mode"),
+        "sync_pid": active.get("pid"),
         "sync_started_at": int(started) if started else None,
         "sync_elapsed_seconds": round(time.time() - started, 1) if started else None,
         "interval_minutes": _clamp_interval(state.get("interval_minutes")),
         "min_interval_minutes": MIN_INTERVAL_MINUTES,
         "max_interval_minutes": MAX_INTERVAL_MINUTES,
         "run_count": int(state.get("run_count", 0)),
-        "last_run": last,
+        "last_run": state.get("last_run"),
         "state_file": str(STATE_FILE),
         "note": "定时同步在 wechat-mcp 进程内运行，随该进程（Snow App）启停；"
-                "开关与间隔已持久化，进程重启后自动恢复。",
+                "开关与间隔已持久化，进程重启后自动恢复。手动同步默认起独立进程"
+                "（脱离 MCP 进程树），因此 MCP 被宿主回收也不会中断。",
     }
 
 
 def sync_now(force: bool = False, redecrypt: bool = True) -> Dict[str, Any]:
-    """立即执行一次同步（供 sync_wechat_database 工具调用）"""
+    """立即执行一次同步（**阻塞式**，供 sync_wechat_database 工具调用）"""
     started = time.time()
     result = refresh_and_sync(force=force, redecrypt=redecrypt)
-    with _lock:
-        state = _load_state()
-        record = {
-            "at": int(time.time()),
-            "duration_seconds": round(time.time() - started, 1),
-            "ok": bool(result.get("ok")),
-            "result": result,
-        }
-        state["last_run"] = record
-        state["run_count"] = int(state.get("run_count", 0)) + 1
-        _save_state(state)
+    record_run(result, started)
     return result
 
 
@@ -332,24 +420,21 @@ def sync_now(force: bool = False, redecrypt: bool = True) -> Dict[str, Any]:
 # ------------------------------------------------------------------
 
 def _sync_worker(force: bool, redecrypt: bool) -> None:
+    """进程内线程版同步（**兜底路径**：独立进程起不来时才用）。
+
+    ⚠️ 短连接宿主（实测 Snow App：每次工具调用 spawn 进程、寿命 < 1 秒）下这个线程
+    会随 MCP 进程被杀，同步跑不完 —— 此时必须依赖 `_spawn_detached_worker`。
+    """
     global _sync_thread, _sync_started_at
+    started = _sync_started_at or time.time()
     try:
         sync_now(force=force, redecrypt=redecrypt)
     except Exception as exc:  # noqa: BLE001 - 后台线程不能把异常抛到线程外
         logger.warning(f"后台同步失败：{exc}")
-        # 关键：异常也必须落盘。调用方（面板按 run_count / last_run 判定完成）
-        # 否则永远等不到「跑完」的信号，只能一直停在「同步中」—— 实测到的卡死根因。
+        # 关键：异常也必须落盘。调用方按 run_count / last_run 判定完成，
+        # 不写就永远等不到「跑完」的信号（面板会一直停在「同步中」）。
         try:
-            with _lock:
-                state = _load_state()
-                state["last_run"] = {
-                    "at": int(time.time()),
-                    "duration_seconds": round(time.time() - (_sync_started_at or time.time()), 1),
-                    "ok": False,
-                    "result": {"ok": False, "error": f"后台同步异常：{exc}"},
-                }
-                state["run_count"] = int(state.get("run_count", 0)) + 1
-                _save_state(state)
+            record_run({"ok": False, "error": f"后台同步异常：{exc}"}, started)
         except Exception as save_exc:  # noqa: BLE001 - 记录失败状态本身不能再抛
             logger.warning(f"写入同步失败状态失败：{save_exc}")
     finally:
@@ -358,29 +443,89 @@ def _sync_worker(force: bool, redecrypt: bool) -> None:
             _sync_started_at = None
 
 
-def start_sync(force: bool = False, redecrypt: bool = True) -> Dict[str, Any]:
-    """在**后台线程**执行一次完整同步并立即返回。
+def _spawn_detached_worker(force: bool, redecrypt: bool) -> Optional[subprocess.Popen]:
+    """起一个**脱离 MCP 进程树**的独立同步进程；环境不支持时返回 None（调用方回退线程）。
 
-    适用于调用方有硬超时的场景（宿主对 MCP 工具调用限制 120s，而「重新解密 +
-    重建索引」在数据量大时会超过该上限）。进度与结果用 ``get_auto_sync_status``
-    的 ``syncing`` / ``last_run`` 查询。
+    为什么必须脱离：部分宿主（实测 Snow App）对 stdio MCP 采用短连接 —— 每次工具调用
+    spawn 一个进程、调用结束即退出（实测进程寿命 < 1 秒）。此时进程内的后台线程会随进程
+    被杀，而一次完整同步要 53 秒，**永远跑不完**。Windows 用 CREATE_BREAKAWAY_FROM_JOB
+    脱离宿主 job（实测连 taskkill /T 都杀不掉），POSIX 用 start_new_session 另开会话。
+    """
+    cmd = [sys.executable, "-m", "wechat_mcp.sync_worker"]
+    if force:
+        cmd.append("--force")
+    if not redecrypt:
+        cmd.append("--no-redecrypt")
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
+    kwargs: Dict[str, Any] = {
+        "cwd": str(USER_WECHAT_DIR.parent),
+        "env": env,
+        # MCP 走 stdio 传 JSON-RPC：绝不能继承管道，也不能把输出混进协议流
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    if os.name == "nt":
+        DETACHED_PROCESS = 0x00000008
+        CREATE_NEW_PROCESS_GROUP = 0x00000200
+        CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+        base = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        try:
+            return subprocess.Popen(cmd, creationflags=base | CREATE_BREAKAWAY_FROM_JOB, **kwargs)
+        except OSError as exc:
+            logger.warning(f"breakaway 启动失败（{exc}），退回不带 breakaway 的 detached")
+            try:
+                return subprocess.Popen(cmd, creationflags=base, **kwargs)
+            except OSError as exc2:
+                logger.warning(f"独立同步进程启动失败：{exc2}")
+                return None
+    try:
+        return subprocess.Popen(cmd, start_new_session=True, **kwargs)
+    except OSError as exc:
+        logger.warning(f"独立同步进程启动失败：{exc}")
+        return None
+
+
+def start_sync(force: bool = False, redecrypt: bool = True) -> Dict[str, Any]:
+    """立即返回，把完整同步交给**独立进程**（起不来时回退进程内线程）。
+
+    适用于调用方有硬超时的场景（宿主对单次 MCP 调用限制 120s，而「重新解密 + 重建索引」
+    在数据量大时会超过该上限）。进度与结果用 ``get_auto_sync_status`` 的 ``syncing`` /
+    ``last_run`` 查询 —— 独立进程把心跳与结果落盘，因此即使 MCP 进程被宿主回收，
+    同步也会继续跑完（这是与「进程内线程」的关键区别）。
     """
     global _sync_thread, _sync_started_at
-    with _lock:
-        if _sync_thread is not None and _sync_thread.is_alive():
-            elapsed = time.time() - (_sync_started_at or time.time())
-            # 僵尸自愈：超过阈值仍未结束就视为卡死，允许重新发起（否则一次卡死会让之后
-            # 每次点击都返回 already_running，面板永远停在「同步中」）
-            if elapsed <= SYNC_STALE_SECONDS:
-                return {
-                    "started": False,
-                    "already_running": True,
-                    "elapsed_seconds": round(elapsed, 1),
-                    "note": "已有同步在运行，请用 get_auto_sync_status 查看进度。",
-                }
-            logger.warning(f"检测到僵死的同步线程（已运行 {elapsed:.0f}s），强制重新发起")
+    active = _active_sync()
+    if active:
+        elapsed = time.time() - float(active.get("started_at") or time.time())
+        # 僵尸自愈：超过阈值仍未结束就视为卡死，允许重新发起（否则一次卡死会让之后
+        # 每次调用都返回 already_running，面板永远停在「同步中」）
+        if elapsed <= SYNC_STALE_SECONDS:
+            return {
+                "started": False,
+                "already_running": True,
+                "elapsed_seconds": round(elapsed, 1),
+                "mode": active.get("mode"),
+                "note": "已有同步在运行，请用 get_auto_sync_status 查看进度。",
+            }
+        logger.warning(f"检测到僵死的同步（已运行 {elapsed:.0f}s），强制重新发起")
+        _clear_sync_state()
+        with _lock:
             _sync_thread = None
             _sync_started_at = None
+
+    proc = _spawn_detached_worker(force, redecrypt)
+    if proc is not None:
+        return {
+            "started": True,
+            "mode": "detached",
+            "pid": proc.pid,
+            "note": "同步已在独立进程开始（重新解密 + 重建索引），用 get_auto_sync_status 查看结果。",
+        }
+
+    # 回退：进程内后台线程（长连接宿主，或 spawn 受限的环境）
+    with _lock:
         _sync_started_at = time.time()
         _sync_thread = threading.Thread(
             target=_sync_worker, args=(force, redecrypt),
@@ -389,5 +534,7 @@ def start_sync(force: bool = False, redecrypt: bool = True) -> Dict[str, Any]:
         _sync_thread.start()
     return {
         "started": True,
-        "note": "同步已在后台开始（重新解密 + 重建索引），用 get_auto_sync_status 查看结果。",
+        "mode": "thread",
+        "note": "独立进程不可用，已改用进程内后台线程；若宿主是短连接（每次调用重启进程），"
+                "同步可能随进程退出而中断，建议改用 sync_wechat_database 阻塞同步。",
     }

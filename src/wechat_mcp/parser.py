@@ -162,6 +162,25 @@ def _summarize_quoted(quoted: str) -> str:
     return "[多媒体消息]"
 
 
+_EMOJI_MD5_RE = re.compile(rb'<emoji\b[^>]*?\bmd5\s*=\s*"([0-9a-fA-F]{32})"', re.IGNORECASE)
+
+
+def extract_emoticon_md5(raw_content, raw_source=None) -> str | None:
+    """从表情消息（local_type=47）的原始 XML 里取出表情 md5。
+
+    微信只在 XML 的 ``<emoji ... md5="...">`` 里给出这个标识（图片本体按 md5
+    命名存在账号目录的 business/emoticon/Persist 下），所以要让面板展示表情，
+    必须先把 md5 存进中间库 —— 只存 "[表情]" 标签是拿不到图的。
+    """
+    raw = maybe_zstd_decompress(raw_content if raw_content else raw_source)
+    if not raw:
+        return None
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8", errors="ignore")
+    match = _EMOJI_MD5_RE.search(raw)
+    return match.group(1).decode("ascii").lower() if match else None
+
+
 def build_content(local_type: int, raw_content, raw_source) -> str:
     """将 raw_content / raw_source 根据 local_type 构建成可读字符串"""
     if local_type == 1:

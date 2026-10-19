@@ -142,7 +142,8 @@ dingtalk-init
 3. `get_session_history(session_id="...", limit=100)`: 获取目标会话的上下文消息流。
 4. `get_message_image(message_id=...)`: **聊天图片按需解密**。当搜索或历史消息中包含 `[图片]` 时，使用对应的消息 `id` 调用此工具。
    - 默认模式：返回解密后图片的本地物理绝对路径（缓存至 `~/.wechat_mcp/images/`），**杜绝因大图 Base64 直接撑爆 Agent 上下文**；
-   - 多模态看图模式：如当前 Agent 需要视觉看图分析，可设置 `include_base64=True` 提取 Base64 字符串供模型理解。
+   - 多模态看图模式：如当前 Agent 需要视觉看图分析，可设置 `include_base64=True` 提取 Base64 字符串供模型理解；
+   - V2 图片缺密钥时该工具会**自动尝试提取一次**（每个 MCP 进程只试一次，命中即落盘并重试解密），无需 Agent 手动干预；若仍失败再按下文「图片 / 表情取不到时的排障顺序」处理。
 5. `get_chat_record(message_id=...)`: **展开「聊天记录」合并转发**。当消息内容显示为 `[聊天记录] 标题` 时，用该消息 `id` 调用，返回被合并的正文条目（文本 / 图片 / 视频 / 文件），无需再手工解析原始 XML。
 6. `search_shared_files(keyword="...", limit=20)`: 定位群内或私聊传输的文件路径。
 
@@ -152,7 +153,22 @@ dingtalk-init
 - **时间范围取数**：`get_messages_by_date(date=...)` / `get_messages_by_range(start, end, order="desc", sender="...")`；两者与 `search_wechat_messages` 一样支持 `offset` 翻页，`get_messages_by_range` 还可用 `sender` 过滤指定成员在指定时段的发言。
 - **会话与成员**：`get_session_overview(session_id)`（单会话轻量概览：总量 / 发言人数 / 峰值时段 / 类型 TopN）、`list_chatroom_members(chatroom_id)`（群成员名单）、`search_contacts(keyword)`（联系人反查）、`get_user_avatars(usernames=[...])`（批量取头像本地路径，**只返回路径不返回图片内容**，避免撑爆上下文）。
 - **聚合与画像**：`get_chat_activity_stats(...)`（活跃度全量指标：小时/天分布、发言榜、基尼系数与 HHI、引用网络、沉默成员、会话片段等）、`get_group_digest(session_id, highlights=N)`（日报/周报一次取齐聚合数据，并返回最长的若干条消息供提炼金句）、`get_member_profile(member, include_samples=N)`（单成员画像，可附带原文样本，便于直接写点评）、`get_persona_style(sender)`（沟通风格蒸馏）。
-- **媒体与收藏**：`search_media_files`（图片/视频磁盘路径）、`list_favorites`（收藏）、`list_emoticons`（表情）。
+- **媒体与收藏**：`search_media_files`（图片/视频磁盘路径）、`list_favorites`（收藏）、`list_emoticons`（表情包与表情的文字说明）。
+- **表情取图**：`prepare_emoticons()` 一次性生成 / 刷新本地明文表情库（委托外部 `wxemo` 完成账号级密钥的 GPU 搜索，产物摊平为 `~/.wechat_mcp/emoticons/<md5>.<ext>`）；随后用 `get_emoticon_image(md5)` 按 md5 取表情图文件路径。md5 来自消息返回的 `emoticon_md5` 字段——表情消息的 `content` 只有 `[表情]`，**必须靠这个字段才能取到图**，不要试图从文本内容里猜。
+  - `wxgf` 私有容器（微信私有格式，内含 HEVC）需转码才能渲染，转码依赖微信自带的 `VoipEngine.dll`（自动从运行中的微信进程定位）；工具采取**按需转码**策略（首次约 1 秒，之后命中缓存）——批量转 1800+ 张要十分钟，因此刻意不在 `prepare_emoticons` 里一次性做完。
+  - 需要 `wxemo` 在 PATH 中，或用环境变量 `WXEMO_BIN` 指定路径，或把可执行文件放到 `~/.wechat_mcp/tools/wxemo/wxemo.exe`。
+- **图片密钥提取**：`extract_image_key()` 从运行中的微信进程内存提取 **V2 图片解密密钥**（微信 4.x 聊天图片的第三代格式：旧 XOR 可离线反推密钥、V1 用固定常量 `cfcd208495d565ef`、**V2 的 AES-128-ECB 密钥是账号级的，只在该账号查看图片时临时缓存于 `Weixin.exe` 进程内存**，磁盘上没有任何副本）。工具扫描微信进程可写内存区域中的「32 字符 alnum」候选，再用真实 V2 文件的密文块做**判定式**验证（只有解出 JPEG/PNG/GIF/WEBP/wxgf 文件头才算命中），命中后写入密钥文件的 `image_aes_key` 字段。
+  - **使用顺序很重要**：先在微信客户端点开 1-2 张图片（看大图，让密钥进入内存），然后**立刻**调用本工具；否则内存里没有密钥，只能返回未命中。
+  - 打开进程读取内存即可，**无需管理员权限**（实测普通权限可用）；未命中时返回 `ok=false` 与原因，不要反复空扫。
+
+#### 图片 / 表情取不到时的排障顺序：
+
+按以下顺序排查，**不要跳步、不要盲目重试**：
+
+1. **确认数据已同步**：`get_sync_status()` 看索引新鲜度；必要时 `start_sync()` 重新解密 + 重建索引。
+2. **图片（`get_message_image`）**：若报错含 `image_aes_key`（V2 缺密钥）→ 工具已自动尝试提取过一次；仍失败则先在客户端点开 1-2 张图片，再手动调用 `extract_image_key()` 落盘密钥，然后重试取图。V1 与旧 XOR 格式无需密钥，**不应**因缺 `image_aes_key` 而失败。
+3. **表情（`get_emoticon_image`）**：若提示表情库未准备 → 先跑 `prepare_emoticons()`；若提示 `wxemo` 找不到 → 按上文三种方式之一放置 `wxemo`；若某个表情取不到 → 多为 `wxgf` 待转码或本地未缓存该表情，按需触发一次转码即可，不必批量重建。
+4. **仍无法解决**：按第 3 节第 1 条的核心禁令执行——**停下并原样上报错误，交由用户决定**，严禁擅自翻源码、改代码或反复猜测重试。
 
 #### 微信增量同步与后台任务：
 

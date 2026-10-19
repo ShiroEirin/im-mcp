@@ -226,7 +226,7 @@ WINDOWS_CONFIG_BLOB_MAX = 1024
 WINDOWS_CONFIG_LITERAL_RE = re.compile(rb"[xX]'([0-9a-fA-F]{64,192})'")
 
 
-def _get_pids_windows() -> list[tuple[int, int]]:
+def _get_pids_windows(verbose: bool = True) -> list[tuple[int, int]]:
     r = subprocess.run(
         ["tasklist", "/FI", "IMAGENAME eq Weixin.exe", "/FO", "CSV", "/NH"],
         capture_output=True, text=True,
@@ -244,9 +244,239 @@ def _get_pids_windows() -> list[tuple[int, int]]:
     if not pids:
         raise RuntimeError("Weixin.exe 未运行")
     pids.sort(key=lambda x: x[1], reverse=True)
-    for pid, mem in pids:
-        _print(f"[+] Weixin.exe PID={pid} ({mem // 1024}MB)")
+    # MCP 走 stdio 传 JSON-RPC：从工具调用链进来的路径必须传 verbose=False，
+    # 否则这里的 stdout 输出会破坏协议管道（emoticons 也只走静默实现）。
+    if verbose:
+        for pid, mem in pids:
+            _print(f"[+] Weixin.exe PID={pid} ({mem // 1024}MB)")
     return pids
+
+
+# ============================================================
+# 内存读取原语（Windows）
+#
+# kernel32 / wintypes 只在 Windows 分支可用（见文件顶部），因此这里一律
+# 惰性获取 —— 模块导入阶段不碰 windll，本模块同时服务 macOS 实现。
+# ============================================================
+
+_MEM_COMMIT = 0x1000
+_READABLE_PROTECTS = {0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80}
+_RW_PROTECTS = {0x04, 0x08, 0x40, 0x80}
+
+
+def _win_kernel32():
+    return ctypes.windll.kernel32
+
+
+class _MemoryBasicInformation(ctypes.Structure):
+    """MEMORY_BASIC_INFORMATION（用 c_ulong 代替 DWORD，避免依赖 wintypes）。"""
+
+    _fields_ = [
+        ("BaseAddress", ctypes.c_uint64), ("AllocationBase", ctypes.c_uint64),
+        ("AllocationProtect", ctypes.c_ulong), ("_pad1", ctypes.c_ulong),
+        ("RegionSize", ctypes.c_uint64), ("State", ctypes.c_ulong),
+        ("Protect", ctypes.c_ulong), ("Type", ctypes.c_ulong), ("_pad2", ctypes.c_ulong),
+    ]
+
+
+def _win_read_mem(h, addr, sz):
+    buf = ctypes.create_string_buffer(sz)
+    n = ctypes.c_size_t(0)
+    if _win_kernel32().ReadProcessMemory(h, ctypes.c_uint64(addr), buf, sz, ctypes.byref(n)):
+        return buf.raw[: n.value]
+    return None
+
+
+def _win_enum_regions(h, max_region: int = 500 * 1024 * 1024, rw_only: bool = False):
+    """枚举进程内已提交且可读的内存区域，返回 ``[(base, size), ...]``。
+
+    ``rw_only=True`` 只取可写区域 —— 字符串密钥都缓存在这里，扫描更快。
+    """
+    kernel32 = _win_kernel32()
+    allowed = _RW_PROTECTS if rw_only else _READABLE_PROTECTS
+    regs: list = []
+    addr = 0
+    mbi = _MemoryBasicInformation()
+    while addr < 0x7FFFFFFFFFFF:
+        if kernel32.VirtualQueryEx(h, ctypes.c_uint64(addr), ctypes.byref(mbi), ctypes.sizeof(mbi)) == 0:
+            break
+        if mbi.State == _MEM_COMMIT and mbi.Protect in allowed and 0 < mbi.RegionSize < max_region:
+            regs.append((mbi.BaseAddress, mbi.RegionSize))
+        nxt = mbi.BaseAddress + mbi.RegionSize
+        if nxt <= addr:
+            break
+        addr = nxt
+    return regs
+
+
+# ============================================================
+# 图片 AES 密钥提取（微信 4.x V2 .dat）
+#
+# 为什么必须单独提取：V2 .dat 的 AES-128-ECB 密钥是账号级的，只在该账号
+# 查看图片时临时缓存于 Weixin.exe 进程内存，磁盘（db_storage / all_keys.json）
+# 上没有任何副本；V1 用固定常量、旧 XOR 格式可离线反推，都不需要它。
+# 因此流程只能是「先在微信客户端点开 1-2 张图 → 立刻扫内存」。
+#
+# 提取方式：该密钥在内存里是 32 字符 alnum 的 ASCII 串（取前 16 字节作
+# AES-128 key）。候选值一律用真实 V2 文件的首个密文块做**判定式**验证 ——
+# 只有解出 JPEG/PNG/GIF/WEBP/wxgf 文件头才算命中，杜绝误报。
+# ============================================================
+
+_V2_MAGIC = b"\x07\x08V2\x08\x07"
+_IMAGE_KEY_RE = re.compile(rb"(?<![0-9A-Za-z])[0-9A-Za-z]{32}(?![0-9A-Za-z])")
+IMAGE_KEY_FIELD = "image_aes_key"
+
+
+def _default_keys_path() -> str:
+    """密钥文件默认位置；独立脚本方式运行时回退到 ~/.wechat_mcp。"""
+    try:
+        from ..config import USER_WECHAT_DIR
+        return str(USER_WECHAT_DIR / "all_keys.json")
+    except Exception:  # noqa: BLE001 - 没有包上下文（直接跑脚本）时用约定路径
+        return os.path.join(os.path.expanduser("~"), ".wechat_mcp", "all_keys.json")
+
+
+def find_v2_cipher_sample(attach_dir: str, scan_limit: int = 200):
+    """取最近修改的 V2 缩略图（``<md5>_t.dat``）的首个 AES 密文块作验证样本。"""
+    candidates: list = []
+    for root, _dirs, files in os.walk(attach_dir):
+        for name in files:
+            if not name.endswith("_t.dat"):
+                continue
+            path = os.path.join(root, name)
+            try:
+                candidates.append((os.path.getmtime(path), path))
+            except OSError:
+                continue
+    candidates.sort(reverse=True)
+    for _mtime, path in candidates[:scan_limit]:
+        try:
+            with open(path, "rb") as f:
+                head = f.read(31)
+        except OSError:
+            continue
+        if head[:6] == _V2_MAGIC and len(head) >= 31:
+            return head[15:31], path
+    return None, None
+
+
+def _image_key_hit(key16: bytes, cipher_block: bytes):
+    """用候选密钥解一个密文块：命中文件头魔数才认，返回格式名。"""
+    try:
+        from Crypto.Cipher import AES
+        dec = AES.new(key16, AES.MODE_ECB).decrypt(cipher_block)
+    except Exception:  # noqa: BLE001 - 候选非法 / 缺依赖都按未命中处理
+        return None
+    if dec[:3] == b"\xff\xd8\xff":
+        return "jpeg"
+    if dec[:4] == b"\x89PNG":
+        return "png"
+    if dec[:4] == b"RIFF" and dec[8:12] == b"WEBP":
+        return "webp"
+    if dec[:3] == b"GIF":
+        return "gif"
+    if dec[:4] == b"wxgf":
+        return "wxgf"
+    return None
+
+
+def extract_image_key(db_dir: str | None = None, keys_file: str | None = None,
+                      max_seconds: float = 180.0) -> dict:
+    """扫描运行中的微信进程内存，提取 V2 图片 AES 密钥并写入密钥文件。
+
+    返回 ``{"ok": bool, "key_masked": str, "format": str, "sample": str, "error": str}``；
+    不抛异常、不向 stdout 输出（MCP 走 stdio，绝不能污染 JSON-RPC）。
+    """
+    if sys.platform != "win32":
+        return {"ok": False, "error": "图片密钥内存提取目前仅支持 Windows（微信 4.x）"}
+
+    keys_path = keys_file or _default_keys_path()
+
+    # 1. 定位 msg/attach（校验样本所在）
+    base_dir = None
+    if db_dir:
+        base_dir = os.path.dirname(os.path.abspath(db_dir))
+    else:
+        try:
+            detected = auto_detect_db_dir()
+            if detected:
+                base_dir = os.path.dirname(os.path.abspath(detected))
+        except Exception:  # noqa: BLE001 - 探测失败不致命，下面统一报错
+            base_dir = None
+    attach_dir = os.path.join(base_dir, "msg", "attach") if base_dir else None
+    if not attach_dir or not os.path.isdir(attach_dir):
+        return {"ok": False, "error": "未找到 msg/attach 目录，无法取得 V2 校验样本"}
+
+    # 2. 取一个真实 V2 密文块作验证样本
+    cipher_block, sample = find_v2_cipher_sample(attach_dir)
+    if cipher_block is None:
+        return {"ok": False, "error": "未找到 V2 格式的 .dat 缩略图，无法校验密钥"}
+
+    # 3. 扫进程内存（只扫可写区域：字符串密钥都缓存在这里）
+    try:
+        # 静默取 PID：本函数也被 MCP 工具（extract_image_key / 取图自动重试）调用，
+        # stdout 上的任何输出都会污染 JSON-RPC 管道。
+        pids = _get_pids_windows(verbose=False)
+    except RuntimeError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    deadline = time.time() + max_seconds
+    found = None
+    for pid, _mem in pids:
+        if found or time.time() > deadline:
+            break
+        h = _win_kernel32().OpenProcess(0x0010 | 0x0400, False, pid)
+        if not h:
+            continue
+        try:
+            for base, size in _win_enum_regions(h, rw_only=True):
+                if time.time() > deadline:
+                    break
+                data = _win_read_mem(h, base, size)
+                if not data:
+                    continue
+                for m in _IMAGE_KEY_RE.finditer(data):
+                    candidate = m.group(0)
+                    fmt = _image_key_hit(candidate[:16], cipher_block)
+                    if fmt:
+                        found = (candidate.decode("ascii"), fmt)
+                        break
+                if found:
+                    break
+        finally:
+            _win_kernel32().CloseHandle(h)
+
+    if not found:
+        return {"ok": False, "error": (
+            "未在微信进程内存中找到图片密钥。密钥只在查看图片时临时缓存，"
+            "请先在微信客户端点开 1-2 张图片（看大图），然后立刻重试。"
+        )}
+
+    key, fmt = found
+
+    # 4. 合并写回密钥文件（保留既有 db 密钥与 _db_dir）
+    try:
+        data = {}
+        if os.path.exists(keys_path):
+            with open(keys_path, encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                data = loaded
+        data[IMAGE_KEY_FIELD] = key
+        tmp_path = keys_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp_path, keys_path)
+    except Exception as exc:  # noqa: BLE001 - 写盘失败要把原因带回调用方
+        return {"ok": False, "error": f"密钥已找到但写入 {keys_path} 失败：{exc}"}
+
+    return {
+        "ok": True,
+        "key_masked": f"{key[:4]}...{key[-4:]}",
+        "format": fmt,
+        "sample": os.path.basename(sample),
+        "keys_file": keys_path,
+    }
 
 
 def _xor_repeat(data: bytes, mask: bytes) -> bytes:
@@ -490,38 +720,8 @@ def _scan_memory_raw_key(db_dir: str, keys_file: str) -> dict:
     _print(f"找到 {len(db_files)} 个数据库, {len(salt_to_dbs)} 个不同的 salt")
 
     kernel32 = ctypes.windll.kernel32
-    MEM_COMMIT = 0x1000
-    READABLE = {0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80}
-
-    class MBI(ctypes.Structure):
-        _fields_ = [
-            ("BaseAddress", ctypes.c_uint64), ("AllocationBase", ctypes.c_uint64),
-            ("AllocationProtect", wt.DWORD), ("_pad1", wt.DWORD),
-            ("RegionSize", ctypes.c_uint64), ("State", wt.DWORD),
-            ("Protect", wt.DWORD), ("Type", wt.DWORD), ("_pad2", wt.DWORD),
-        ]
-
-    def read_mem(h, addr, sz):
-        buf = ctypes.create_string_buffer(sz)
-        n = ctypes.c_size_t(0)
-        if kernel32.ReadProcessMemory(h, ctypes.c_uint64(addr), buf, sz, ctypes.byref(n)):
-            return buf.raw[: n.value]
-        return None
-
-    def enum_regions(h):
-        regs = []
-        addr = 0
-        mbi = MBI()
-        while addr < 0x7FFFFFFFFFFF:
-            if kernel32.VirtualQueryEx(h, ctypes.c_uint64(addr), ctypes.byref(mbi), ctypes.sizeof(mbi)) == 0:
-                break
-            if mbi.State == MEM_COMMIT and mbi.Protect in READABLE and 0 < mbi.RegionSize < 500 * 1024 * 1024:
-                regs.append((mbi.BaseAddress, mbi.RegionSize))
-            nxt = mbi.BaseAddress + mbi.RegionSize
-            if nxt <= addr:
-                break
-            addr = nxt
-        return regs
+    read_mem = _win_read_mem
+    enum_regions = _win_enum_regions
 
     pids = _get_pids_windows()
     key_map: dict[str, str] = {}

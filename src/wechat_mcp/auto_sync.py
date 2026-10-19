@@ -49,12 +49,38 @@ REDECRYPT_TIMEOUT_SECONDS = 600
 
 _stop_event = threading.Event()
 _worker: Optional[threading.Thread] = None
+# 手动「后台同步」线程：start_sync 用它避免调用方等待超时
+_sync_thread: Optional[threading.Thread] = None
+# 本次后台同步的启动时间（epoch 秒）：供 get_auto_sync_status 报告「已跑多久」
+_sync_started_at: Optional[float] = None
+# 僵尸判定阈值：后台同步超过该时长仍未结束，视为卡死，允许重新发起（实测一次同步 1–3 分钟）
+SYNC_STALE_SECONDS = 20 * 60
 _lock = threading.RLock()
 
 
 # ------------------------------------------------------------------
 # 1) 重新解密（子进程，静默）
 # ------------------------------------------------------------------
+
+def _db_dir_from_keys(keys_path: Path) -> Optional[str]:
+    """读取密钥文件里记录的 ``_db_dir``（``wechat-init`` 提取密钥时写入的目录）。
+
+    为什么需要这条回退：``wechat-mcp`` 由宿主进程（Snow App / Electron）启动，
+    其环境变量与用户在终端里跑 ``wechat-init`` 时并不相同 —— 缺 ``APPDATA`` /
+    ``USERPROFILE`` 时 ``auto_detect_db_dir()`` 会返回 None，同步就会以
+    「未找到绿泡泡 db_storage 目录」失败，而密钥文件里其实一直记着当初成功
+    解密用过的那个目录。
+    """
+    try:
+        with open(keys_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:  # noqa: BLE001 - 文件损坏/不可读时静默走下一级回退
+        return None
+    value = data.get("_db_dir") if isinstance(data, dict) else None
+    if isinstance(value, str) and value.strip() and os.path.isdir(value):
+        return value
+    return None
+
 
 def refresh_decrypted(db_dir: Optional[str] = None,
                       keys_file: Optional[Path] = None) -> Dict[str, Any]:
@@ -68,14 +94,25 @@ def refresh_decrypted(db_dir: Optional[str] = None,
         return {"ok": False,
                 "error": f"密钥文件不存在：{keys_path}。请先运行 wechat-init 提取密钥。"}
 
+    # db_storage 定位按可靠性递减：显式参数 → 环境变量 → 自动探测 → 密钥文件记录。
+    # 任一级命中即用，全部失败才报错（错误信息给出两条可操作出路）。
+    if not db_dir:
+        env_dir = (os.environ.get("WECHAT_DB_DIR") or "").strip()
+        if env_dir and os.path.isdir(env_dir):
+            db_dir = env_dir
     if not db_dir:
         try:
             from .tools.key_tool import auto_detect_db_dir
             db_dir = auto_detect_db_dir()
-        except Exception as exc:  # noqa: BLE001
-            return {"ok": False, "error": f"自动检测 db_storage 失败：{exc}"}
+        except Exception as exc:  # noqa: BLE001 - 探测失败不致命，下面还有密钥文件回退
+            logger.warning(f"自动检测 db_storage 失败：{exc}")
+    if not db_dir:
+        db_dir = _db_dir_from_keys(keys_path)
     if not db_dir or not os.path.isdir(db_dir):
-        return {"ok": False, "error": "未找到绿泡泡 db_storage 目录。"}
+        return {"ok": False, "error": (
+            "未找到绿泡泡 db_storage 目录（自动检测失败，密钥文件里也没有可用的 _db_dir）。"
+            "可用环境变量 WECHAT_DB_DIR 指定数据目录，或重新运行 wechat-init。"
+        )}
 
     out_dir = get_decrypted_dir()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -95,6 +132,8 @@ def refresh_decrypted(db_dir: Optional[str] = None,
         proc = subprocess.run(
             cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
             env=env, timeout=REDECRYPT_TIMEOUT_SECONDS, cwd=str(USER_WECHAT_DIR.parent),
+            # MCP 是 stdio 服务：绝不能把 JSON-RPC 管道继承给子进程（防御性隔离）
+            stdin=subprocess.DEVNULL,
         )
     except subprocess.TimeoutExpired:
         return {"ok": False, "error": f"重新解密超时（>{REDECRYPT_TIMEOUT_SECONDS}s）"}
@@ -250,9 +289,15 @@ def get_auto_sync_status() -> Dict[str, Any]:
     state = _load_state()
     with _lock:
         last = state.get("last_run")
+        syncing = bool(_sync_thread is not None and _sync_thread.is_alive())
+        started = _sync_started_at if syncing else None
     return {
         "enabled": bool(state.get("enabled")),
         "running": bool(_worker is not None and _worker.is_alive()),
+        "syncing": syncing,
+        # 让调用方能判断「这次同步已经跑了多久」，从而区分「正常在跑」与「卡死」
+        "sync_started_at": int(started) if started else None,
+        "sync_elapsed_seconds": round(time.time() - started, 1) if started else None,
         "interval_minutes": _clamp_interval(state.get("interval_minutes")),
         "min_interval_minutes": MIN_INTERVAL_MINUTES,
         "max_interval_minutes": MAX_INTERVAL_MINUTES,
@@ -280,3 +325,69 @@ def sync_now(force: bool = False, redecrypt: bool = True) -> Dict[str, Any]:
         state["run_count"] = int(state.get("run_count", 0)) + 1
         _save_state(state)
     return result
+
+
+# ------------------------------------------------------------------
+# 6) 后台手动同步（供有硬超时的调用方使用）
+# ------------------------------------------------------------------
+
+def _sync_worker(force: bool, redecrypt: bool) -> None:
+    global _sync_thread, _sync_started_at
+    try:
+        sync_now(force=force, redecrypt=redecrypt)
+    except Exception as exc:  # noqa: BLE001 - 后台线程不能把异常抛到线程外
+        logger.warning(f"后台同步失败：{exc}")
+        # 关键：异常也必须落盘。调用方（面板按 run_count / last_run 判定完成）
+        # 否则永远等不到「跑完」的信号，只能一直停在「同步中」—— 实测到的卡死根因。
+        try:
+            with _lock:
+                state = _load_state()
+                state["last_run"] = {
+                    "at": int(time.time()),
+                    "duration_seconds": round(time.time() - (_sync_started_at or time.time()), 1),
+                    "ok": False,
+                    "result": {"ok": False, "error": f"后台同步异常：{exc}"},
+                }
+                state["run_count"] = int(state.get("run_count", 0)) + 1
+                _save_state(state)
+        except Exception as save_exc:  # noqa: BLE001 - 记录失败状态本身不能再抛
+            logger.warning(f"写入同步失败状态失败：{save_exc}")
+    finally:
+        with _lock:
+            _sync_thread = None
+            _sync_started_at = None
+
+
+def start_sync(force: bool = False, redecrypt: bool = True) -> Dict[str, Any]:
+    """在**后台线程**执行一次完整同步并立即返回。
+
+    适用于调用方有硬超时的场景（宿主对 MCP 工具调用限制 120s，而「重新解密 +
+    重建索引」在数据量大时会超过该上限）。进度与结果用 ``get_auto_sync_status``
+    的 ``syncing`` / ``last_run`` 查询。
+    """
+    global _sync_thread, _sync_started_at
+    with _lock:
+        if _sync_thread is not None and _sync_thread.is_alive():
+            elapsed = time.time() - (_sync_started_at or time.time())
+            # 僵尸自愈：超过阈值仍未结束就视为卡死，允许重新发起（否则一次卡死会让之后
+            # 每次点击都返回 already_running，面板永远停在「同步中」）
+            if elapsed <= SYNC_STALE_SECONDS:
+                return {
+                    "started": False,
+                    "already_running": True,
+                    "elapsed_seconds": round(elapsed, 1),
+                    "note": "已有同步在运行，请用 get_auto_sync_status 查看进度。",
+                }
+            logger.warning(f"检测到僵死的同步线程（已运行 {elapsed:.0f}s），强制重新发起")
+            _sync_thread = None
+            _sync_started_at = None
+        _sync_started_at = time.time()
+        _sync_thread = threading.Thread(
+            target=_sync_worker, args=(force, redecrypt),
+            name="wechat-manual-sync", daemon=True,
+        )
+        _sync_thread.start()
+    return {
+        "started": True,
+        "note": "同步已在后台开始（重新解密 + 重建索引），用 get_auto_sync_status 查看结果。",
+    }

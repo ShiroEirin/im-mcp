@@ -19,7 +19,7 @@ import logging
 from pathlib import Path
 from typing import Dict
 
-from ..parser import build_content
+from ..parser import build_content, extract_emoticon_md5
 
 logger = logging.getLogger(__name__)
 
@@ -196,6 +196,12 @@ def sync_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
                         
                         target_session = session_name or f"chat_{tbl_hash}"
                         content = build_content(r["local_type"], r["message_content"], r["source"])
+                        # 表情消息（47）额外存 md5：图片本体按 md5 命名存在账号目录，
+                        # 只存 "[表情]" 标签的话面板永远拿不到表情图。
+                        emoticon_md5 = (
+                            extract_emoticon_md5(r["message_content"], r["source"])
+                            if r["local_type"] == 47 else None
+                        )
 
                         # 用 UPSERT 而非 INSERT OR REPLACE：REPLACE 是「先删后插」，
                         # 而 recursive_triggers 默认关闭，AFTER DELETE 触发器不会触发，
@@ -203,14 +209,15 @@ def sync_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
                         # 每次 ETL 都漂移、索引无界膨胀。UPSERT 原地更新，rowid 稳定。
                         cur.execute("""
                             INSERT INTO messages
-                            (source_file, local_id, session_username, sender_username, create_time, local_type, content)
-                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                            (source_file, local_id, session_username, sender_username, create_time, local_type, content, emoticon_md5)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                             ON CONFLICT(source_file, session_username, local_id) DO UPDATE SET
                                 sender_username = excluded.sender_username,
                                 create_time     = excluded.create_time,
                                 local_type      = excluded.local_type,
-                                content         = excluded.content
-                        """, (db_file.name, r["local_id"], target_session, sender_name, r["create_time"], r["local_type"], content))
+                                content         = excluded.content,
+                                emoticon_md5    = excluded.emoticon_md5
+                        """, (db_file.name, r["local_id"], target_session, sender_name, r["create_time"], r["local_type"], content, emoticon_md5))
 
                 m_conn.close()
             except Exception as e:

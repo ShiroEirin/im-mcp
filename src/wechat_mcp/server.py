@@ -12,6 +12,10 @@ from mcp.server.fastmcp import FastMCP
 from .config import DB_PATH, BASE_DIR
 from .database import get_connection, init_schema, release_connections, sync_data
 from .images import get_image_for_message
+from .emoticons import (
+    get_emoticon_image as _get_emoticon_image,
+    prepare_emoticons as _prepare_emoticons,
+)
 from .records import get_chat_record as _get_chat_record
 from .parser import type_label
 from .auto_sync import (
@@ -593,11 +597,11 @@ def search_wechat_messages(
     sql = f"""
         SELECT m.id, m.session_username, s.display_name AS session_name,
                m.sender_username, c.display_name AS sender_name,
-               m.create_time, m.content
-        FROM messages m
-        LEFT JOIN sessions s ON s.username = m.session_username
-        LEFT JOIN contacts c ON c.username = m.sender_username
-        WHERE {where_sql}
+               m.create_time, m.content, m.emoticon_md5
+       FROM messages m
+       LEFT JOIN sessions s ON s.username = m.session_username
+       LEFT JOIN contacts c ON c.username = m.sender_username
+       WHERE {where_sql}
     """
     for token in tokens:
         sql += " AND m.content LIKE ? ESCAPE '\\'"
@@ -628,6 +632,8 @@ def search_wechat_messages(
             "sender_username": r["sender_username"],
             "time": _ts_to_str(r["create_time"]),
             "content": r["content"],
+            # 表情消息的 md5：面板据此调 get_emoticon_image 取表情图（缺省为 None）
+            "emoticon_md5": r["emoticon_md5"],
             # 命中上下文：调用方无需自己截断长消息（多词命中取最靠前的一个）
             "snippet": _snippet(r["content"], tokens),
         })
@@ -754,7 +760,7 @@ def get_session_history(session_id: str, limit: int = 50, days: Optional[int] = 
     limit = _clamp(limit, 50, 200)
     sql = """
         SELECT m.id, m.sender_username, c.display_name AS sender_name,
-               m.create_time, m.content
+               m.create_time, m.content, m.emoticon_md5
         FROM messages m
         LEFT JOIN contacts c ON c.username = m.sender_username
         WHERE m.session_username = ?
@@ -782,6 +788,7 @@ def get_session_history(session_id: str, limit: int = 50, days: Optional[int] = 
             "sender_username": r["sender_username"],
             "time": _ts_to_str(r["create_time"]),
             "content": r["content"],
+            "emoticon_md5": r["emoticon_md5"],
         })
     conn.close()
     return results
@@ -853,6 +860,47 @@ def get_message_image(message_id: int, include_base64: bool = False) -> Dict[str
     if err:
         return {"error": err}
     return get_image_for_message(message_id=message_id, include_base64=include_base64)
+
+
+@mcp.tool()
+@_db_tool
+def get_emoticon_image(md5: str) -> Dict[str, Any]:
+    """按表情 md5 取本地明文表情图（自定义表情 / 表情包）。
+
+    表情消息的 `content` 只有 `[表情]` 三个字，但返回里额外带 `emoticon_md5`
+    字段 —— 把它传进本工具即可拿到可直接渲染的图片文件路径（gif / png / jpg /
+    webp / APNG），供面板等宿主读盘展示。
+
+    前置：需要先用 `prepare_emoticons` 生成明文表情库（微信的表情文件是账号级
+    加密的，解密要做一次 GPU 搜索，不适合放进每次调用）。表情库未准备、或该
+    表情未被本地缓存时，返回 `error` 与可操作提示。
+
+    Args:
+        md5: 表情标识，来自消息返回的 `emoticon_md5`
+    """
+    return _get_emoticon_image(md5=md5)
+
+
+@mcp.tool()
+def prepare_emoticons() -> Dict[str, Any]:
+    """生成 / 刷新本地明文表情库（一次性操作，供 `get_emoticon_image` 使用）。
+
+    微信 4.x 的自定义表情文件（`business/emoticon/Persist/<两位>/<md5>:<ext>`）
+    使用账号级密钥加密：
+
+        key = MD5(f"{seed}{wxid}EMOTICON").digest()
+        plaintext = AES-128-CBC(key, iv=key).decrypt(ciphertext)
+
+    其中 `seed` 落在 `0..2^32` 空间、需要 GPU/SIMD 暴力搜索，因此这一步委托外部
+    工具 wxemo（https://github.com/azazo1/wxemo）完成；本工具负责调用它，并把
+    产物摊平成 `~/.wechat_mcp/emoticons/<md5>.<ext>` 供快速查询。
+
+    需要：wxemo 在 PATH 中（或用环境变量 `WXEMO_BIN` 指定完整路径），且已跑过
+    一次 `wxemo seed search`（seed 缓存在 wxemo 自己的配置目录里）。wxgf 私有
+    格式的转码还需要微信自带的 VoipEngine.dll（会自动从运行中的微信进程定位，
+    找不到时只跳过 wxgf 那一部分，原生 gif/png/jpg 照常可用）。
+    """
+    return _prepare_emoticons()
 
 
 @mcp.tool()
@@ -994,7 +1042,7 @@ def get_messages_by_date(date: str, session_id: Optional[str] = None, limit: int
     sql = """
         SELECT m.id, m.session_username, s.display_name AS session_name,
                m.sender_username, c.display_name AS sender_name,
-               m.create_time, m.content
+               m.create_time, m.content, m.emoticon_md5
         FROM messages m
         LEFT JOIN sessions s ON s.username = m.session_username
         LEFT JOIN contacts c ON c.username = m.sender_username
@@ -1019,6 +1067,7 @@ def get_messages_by_date(date: str, session_id: Optional[str] = None, limit: int
             "sender_username": r["sender_username"],
             "time": _ts_to_str(r["create_time"]),
             "content": r["content"],
+            "emoticon_md5": r["emoticon_md5"],
         })
     conn.close()
     return results
@@ -1086,6 +1135,26 @@ def get_auto_sync_status() -> Dict[str, Any]:
     用于确认「定时同步到底有没有在跑」以及上一轮同步是否成功。
     """
     return _auto_sync_status()
+
+
+@mcp.tool()
+def extract_image_key() -> Dict[str, Any]:
+    """从运行中的绿泡泡进程内存提取**图片解密密钥**（微信 4.x V2 加密图片）。
+
+    背景：微信 4.x 的聊天图片（.dat）有三代格式 —— 旧 XOR 格式可离线反推密钥、
+    V1 用固定常量；**V2 的 AES 密钥是账号级的，只在该账号查看图片时临时缓存于
+    Weixin.exe 进程内存**，磁盘上没有任何副本。缺它时 `get_message_image` 对 V2
+    图片一律返回 `WeChat 4.x V2 image encryption requires image_aes_key`。
+
+    使用流程（顺序很重要）：先在绿泡泡客户端点开 1-2 张图片（看大图，让密钥进入
+    内存），然后**立刻**调用本工具。成功后密钥会写入密钥文件（`image_aes_key`
+    字段），之后 `get_message_image` 即可直接解密，无需重复提取。
+
+    返回 `{"ok": true, "key_masked": "7396...f5a6", "format": "jpeg", ...}`；
+    未命中时 `ok=false` 并说明原因（通常是还没在客户端看图，或需要管理员权限）。
+    """
+    from .tools.key_tool import extract_image_key as _extract_image_key
+    return _extract_image_key()
 
 @mcp.tool()
 @_db_tool
@@ -1217,7 +1286,7 @@ def get_messages_by_range(start: str, end: str, session_id: Optional[str] = None
     sql = """
         SELECT m.id, m.session_username, s.display_name AS session_name,
                m.sender_username, c.display_name AS sender_name,
-               m.create_time, m.content
+               m.create_time, m.content, m.emoticon_md5
         FROM messages m
         LEFT JOIN sessions s ON s.username = m.session_username
         LEFT JOIN contacts c ON c.username = m.sender_username
@@ -1251,6 +1320,7 @@ def get_messages_by_range(start: str, end: str, session_id: Optional[str] = None
             "sender_username": r["sender_username"],
             "time": _ts_to_str(r["create_time"]),
             "content": r["content"],
+            "emoticon_md5": r["emoticon_md5"],
         }
         for r in rows
     ]
@@ -1315,7 +1385,7 @@ def get_messages_since(
     sql = f"""
         SELECT m.id, m.session_username, s.display_name AS session_name,
                m.sender_username, c.display_name AS sender_name,
-               m.create_time, m.content
+               m.create_time, m.content, m.emoticon_md5
         FROM messages m
         LEFT JOIN sessions s ON s.username = m.session_username
         LEFT JOIN contacts c ON c.username = m.sender_username
@@ -1336,6 +1406,7 @@ def get_messages_since(
             "sender_username": r["sender_username"],
             "time": _ts_to_str(r["create_time"]),
             "content": r["content"],
+            "emoticon_md5": r["emoticon_md5"],
         }
         for r in rows
     ]

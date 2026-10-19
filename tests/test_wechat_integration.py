@@ -17,7 +17,7 @@ class TestRealHostEndToEnd(unittest.TestCase):
         cls.db_available = DB_PATH.exists()
 
     def test_registered_tools_count(self):
-        # 微信 MCP 必须完整对外注册 26 个核心工具
+        # 微信 MCP 必须完整对外注册 29 个核心工具
         tools = [t.name for t in mcp._tool_manager.list_tools()]
         expected_tools = [
             "search_wechat_messages",
@@ -46,10 +46,13 @@ class TestRealHostEndToEnd(unittest.TestCase):
             "get_user_avatars",
             "set_auto_sync",
             "get_auto_sync_status",
+            "extract_image_key",
+            "get_emoticon_image",
+            "prepare_emoticons",
         ]
         for exp in expected_tools:
             self.assertIn(exp, tools)
-        self.assertEqual(len(tools), 26)
+        self.assertEqual(len(tools), 29)
 
     def test_search_wechat_messages_supports_sender_range_and_snippet(self):
         """search_wechat_messages 的发言人 / 时间窗过滤与 snippet 必须真实可用。"""

@@ -108,6 +108,9 @@ def sync_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
                 s_conn.row_factory = sqlite3.Row
                 cols = [r[1] for r in s_conn.execute("PRAGMA table_info(SessionTable)").fetchall()]
                 time_col = "last_timestamp" if "last_timestamp" in cols else ("last_time" if "last_time" in cols else "0")
+                # 未读数：不同微信版本列名不同（unread_count / unreadCount / unread），都没有就填 0
+                unread_col = next((c for c in ("unread_count", "unreadCount", "unread") if c in cols), None)
+                unread_expr = unread_col if unread_col else "0"
                 
                 # 预载联系人昵称，避免逐会话回查（原实现是 N+1 查询）
                 name_by_user = {
@@ -115,7 +118,7 @@ def sync_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
                     for row in cur.execute("SELECT username, display_name FROM contacts")
                     if row[0]
                 }
-                for r in s_conn.execute(f"SELECT username, summary, {time_col} AS last_time FROM SessionTable"):
+                for r in s_conn.execute(f"SELECT username, summary, {time_col} AS last_time, {unread_expr} AS unread FROM SessionTable"):
                     uname = r["username"]
                     if not uname:
                         continue
@@ -123,9 +126,9 @@ def sync_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
                     dname = name_by_user.get(uname) or uname
 
                     cur.execute("""
-                        INSERT OR REPLACE INTO sessions (username, type, display_name, last_time, last_msg_preview)
-                        VALUES (?, ?, ?, ?, ?)
-                    """, (uname, stype, dname, r["last_time"], r["summary"]))
+                        INSERT OR REPLACE INTO sessions (username, type, display_name, last_time, last_msg_preview, unread)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, (uname, stype, dname, r["last_time"], r["summary"], int(r["unread"] or 0)))
                 s_conn.close()
             except Exception as e:
                 logger.warning(f"Error parsing session db {db_file}: {e}")

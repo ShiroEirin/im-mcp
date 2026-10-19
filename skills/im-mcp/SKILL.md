@@ -138,14 +138,33 @@ dingtalk-init
 
 #### 微信 (wechat) 推荐调用顺序：
 1. `list_wechat_sessions(limit=20)`: 先列出最近活跃的会话/群聊，拿到关键的 `session_id`（如 `xxx@chatroom` 或微信号）。
-2. `search_wechat_messages(query="关键词", limit=50)`: 全局全文检索聊天内容（支持 `offset` 翻页）。
+2. `search_wechat_messages(query="关键词", limit=50)`: 全局全文检索聊天内容（支持 `offset` 翻页；每条结果附带 `snippet` 命中上下文，可直接展示）。
 3. `get_session_history(session_id="...", limit=100)`: 获取目标会话的上下文消息流。
 4. `get_message_image(message_id=...)`: **聊天图片按需解密**。当搜索或历史消息中包含 `[图片]` 时，使用对应的消息 `id` 调用此工具。
    - 默认模式：返回解密后图片的本地物理绝对路径（缓存至 `~/.wechat_mcp/images/`），**杜绝因大图 Base64 直接撑爆 Agent 上下文**；
    - 多模态看图模式：如当前 Agent 需要视觉看图分析，可设置 `include_base64=True` 提取 Base64 字符串供模型理解。
-5. `search_shared_files(keyword="...", limit=20)`: 定位群内或私聊传输的文件路径。
+5. `get_chat_record(message_id=...)`: **展开「聊天记录」合并转发**。当消息内容显示为 `[聊天记录] 标题` 时，用该消息 `id` 调用，返回被合并的正文条目（文本 / 图片 / 视频 / 文件），无需再手工解析原始 XML。
+6. `search_shared_files(keyword="...", limit=20)`: 定位群内或私聊传输的文件路径。
 
-微信侧另提供：`get_messages_by_date` / `get_messages_by_range`（按日期或时间范围取数）、`search_contacts`（联系人反查）、`list_chatroom_members`（群成员名单）、`search_media_files`（图片/视频磁盘路径）、`list_favorites`（收藏）、`list_emoticons`（表情）、`get_chat_activity_stats`（活跃度统计）、`get_persona_style`（沟通风格蒸馏）、`get_sync_status`（索引新鲜度）。其中 `get_messages_by_date` / `get_messages_by_range` 与 `search_wechat_messages` 一样支持 `offset` 翻页。
+#### 微信侧其余工具（按场景选用）：
+
+- **增量与未读**：`get_messages_since(after_id=...)`（游标式增量拉取，返回 `next_cursor` 供下次续拉，适合面板/脚本刷新）、`get_unread_sessions(min_unread=1)`（列出有未读的会话，回答“还有哪些群没看”）、`get_sync_status`（索引新鲜度与规模）。
+- **时间范围取数**：`get_messages_by_date(date=...)` / `get_messages_by_range(start, end, order="desc", sender="...")`；两者与 `search_wechat_messages` 一样支持 `offset` 翻页，`get_messages_by_range` 还可用 `sender` 过滤指定成员在指定时段的发言。
+- **会话与成员**：`get_session_overview(session_id)`（单会话轻量概览：总量 / 发言人数 / 峰值时段 / 类型 TopN）、`list_chatroom_members(chatroom_id)`（群成员名单）、`search_contacts(keyword)`（联系人反查）、`get_user_avatars(usernames=[...])`（批量取头像本地路径，**只返回路径不返回图片内容**，避免撑爆上下文）。
+- **聚合与画像**：`get_chat_activity_stats(...)`（活跃度全量指标：小时/天分布、发言榜、基尼系数与 HHI、引用网络、沉默成员、会话片段等）、`get_group_digest(session_id, highlights=N)`（日报/周报一次取齐聚合数据，并返回最长的若干条消息供提炼金句）、`get_member_profile(member, include_samples=N)`（单成员画像，可附带原文样本，便于直接写点评）、`get_persona_style(sender)`（沟通风格蒸馏）。
+- **媒体与收藏**：`search_media_files`（图片/视频磁盘路径）、`list_favorites`（收藏）、`list_emoticons`（表情）。
+
+#### 微信增量同步与后台任务：
+
+微信客户端在线时，新消息只写入**原加密库**，必须重新解密 + 重建索引后才能被检索到：
+
+1. `sync_wechat_database(force=False, redecrypt=True)`: **阻塞式**同步，返回即完成（数据量大时可能数十秒，受宿主单次调用超时限制）。
+2. `start_sync(force=False, redecrypt=True)`: **非阻塞**，立即返回 `{started: true, mode, pid}`，同步交给独立进程执行；`mode=detached` 表示已脱离 MCP 进程，**即使宿主回收 MCP 进程，同步也会继续跑完**。
+3. `get_auto_sync_status()`: 查询进度与结果 —— `syncing` / `run_count` / `last_run` / `sync_started_at` / `sync_elapsed_seconds`。
+4. `set_auto_sync(enabled=True, interval_minutes=30)`: 开启定时自动同步（间隔 5–1440 分钟）。
+
+- **推荐用法**：不确定同步耗时、或宿主对单次工具调用有超时限制时，优先 `start_sync`，再轮询 `get_auto_sync_status` 直到 `syncing=false`，最后检查 `last_run.ok`。
+- **收到 `already_running`**：说明已有同步在跑，**不要重复发起**，改用 `get_auto_sync_status` 查看进度。
 
 #### 钉钉 (dingtalk) 推荐调用顺序：
 1. `list_dingtalk_conversations(limit=20)`: 获取最近群聊与私聊列表（已自动映射最新实名及群名）。
@@ -258,7 +277,7 @@ im-clean --scope dingtalk -y
    - **必须**直接暂停，并友好向用户确认客户端登录状态。
 
 5. **微信增量消息同步问题**：
-   微信客户端在线时，新消息会写入原加密库。如需获取刚刚产生的新消息，智能体可提示用户“重新执行 `wechat-init`”以更新本地解密库。
+   微信客户端在线时，新消息会写入原加密库。**优先调用 MCP 同步工具**：`start_sync()` 非阻塞触发（推荐，宿主对单次调用有超时限制也不会中断同步），或 `sync_wechat_database()` 阻塞等待完成；随后用 `get_auto_sync_status()` 确认 `last_run.ok` 为真、`syncing` 已归零。仅当需要**重新提取密钥**（换机、密钥失效、首次部署）时才重新执行 `wechat-init`。
 
 6. **钉钉 WAL 锁问题**：
    `dingtalk-init` 已内置自动拷贝机制，即使钉钉正在运行且处于 WAL 事务中，也不会发生 SQLite 锁库冲突。

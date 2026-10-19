@@ -54,7 +54,8 @@ def init_schema():
             message_count INTEGER DEFAULT 0,
             first_time INTEGER,
             last_time INTEGER,
-            last_msg_preview TEXT
+            last_msg_preview TEXT,
+            unread INTEGER DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS contacts (
@@ -159,12 +160,17 @@ def init_schema():
 
         CREATE INDEX IF NOT EXISTS idx_avatars_md5 ON avatars(md5);
     """)
+    # 旧库迁移：sessions.unread（会话未读数快照，ETL 时从源库写入）
+    try:
+        conn.execute("ALTER TABLE sessions ADD COLUMN unread INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass  # 列已存在
     conn.commit()
     conn.close()
 
 # ETL 解析/中间库结构版本号。解析逻辑或表结构变化时必须递增，
 # 否则老用户升级后源库文件未变 -> 指纹一致 -> 直接 skipped，新逻辑永不生效。
-ETL_SCHEMA_VERSION = "5"
+ETL_SCHEMA_VERSION = "6"
 
 # 派生表（media_files / favorites / emoticons / avatars）结构版本。这些表每次
 # ETL 都会从源库整体重建，因此结构升级时直接 DROP 重建最安全，不会丢用户数据。

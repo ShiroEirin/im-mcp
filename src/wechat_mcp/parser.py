@@ -76,6 +76,24 @@ APPMSG_LABELS = {
     62: "拍一拍",
 }
 
+def type_label(local_type) -> str:
+    """把微信的复合 local_type 映射成人类可读标签。
+
+    微信 4.x 的 ``local_type`` 低 32 位是基础类型，高 32 位是 appmsg 子类型；
+    例如 ``6 << 32 | 49`` 是文件、``57 << 32 | 49`` 是引用。面板、Agent 与脚本
+    共用这一份判定，避免各自维护映射表。
+    """
+    try:
+        t = int(local_type or 0)
+    except (TypeError, ValueError):
+        return "其他"
+    base = t & 0xFFFFFFFF
+    app_type = (t >> 32) if t > 0xFFFFFFFF else 0
+    if base == 49 and app_type:
+        return APPMSG_LABELS.get(app_type, "应用消息")
+    return TYPE_LABELS.get(base, "其他")
+
+
 def _clean_xml_text(value: str) -> str:
     """去掉 CDATA 包裹并还原常见 XML 实体"""
     text = (value or "").strip()

@@ -56,13 +56,11 @@ def _check_db_initialized() -> Optional[str]:
             conn.close()
             return "绿泡泡数据库存在但数据表未初始化。请在终端运行 `wechat-init --etl-only` 重建索引。"
         # 老版本建的库可能缺少后续新增的表（chatroom_members / media_files /
-        # favorites / emoticons / avatars），会让对应工具抛裸 OperationalError。init_schema
-        # 是幂等的 CREATE TABLE IF NOT EXISTS，这里直接补齐（表为空，需跑 ETL 才有数据）。
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        have = {r[0] for r in cur.fetchall()}
+        # favorites / emoticons / avatars），或者 messages / sessions 缺少新增的列
+        # （如 unread / emoticon_md5），会让对应工具抛裸 OperationalError。
+        # 始终调用 init_schema() 执行幂等补表与 ALTER TABLE 迁移。
         conn.close()
-        if {"chatroom_members", "media_files", "favorites", "emoticons", "avatars"} - have:
-            init_schema()
+        init_schema()
         return None
     except Exception as e:
         return f"绿泡泡数据库无法访问: {e}。请尝试重新运行 `wechat-init`。"

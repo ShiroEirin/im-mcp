@@ -18,6 +18,10 @@ RELATED_PROCESS_KEYWORDS = [
     "dingtalk-mcp",
     "wechat_mcp.server",
     "dingtalk_mcp.server",
+    # start_sync 拉起的独立同步进程（python -m wechat_mcp.sync_worker）。它刻意脱离 MCP
+    # 进程树，宿主回收 MCP 后仍会继续跑并锁住 decrypted/ 与 app.db，必须一并识别，
+    # 否则清理会在删除阶段失败并误导用户去「退出客户端」。
+    "wechat_mcp.sync_worker",
 ]
 
 

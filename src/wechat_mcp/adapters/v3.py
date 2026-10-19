@@ -83,13 +83,16 @@ def sync_v3(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
                 cols = [r[1] for r in c_conn.execute("PRAGMA table_info(Session)").fetchall()]
                 time_col = "CreateTime" if "CreateTime" in cols else "0"
                 content_col = "Content" if "Content" in cols else "''"
+                # 未读数：3.x 常见列名是 UnReadCount（大小写随版本），都没有就填 0
+                unread_col = next((c for c in ("UnReadCount", "UnreadCount", "unread") if c in cols), None)
+                unread_expr = unread_col if unread_col else "0"
                 # 预载联系人昵称，避免逐会话回查（N+1）
                 name_by_user = {
                     row[0]: row[1]
                     for row in cur.execute("SELECT username, display_name FROM contacts")
                     if row[0]
                 }
-                for r in c_conn.execute(f"SELECT strUsrName, {time_col} AS last_time, {content_col} AS summary FROM Session"):
+                for r in c_conn.execute(f"SELECT strUsrName, {time_col} AS last_time, {content_col} AS summary, {unread_expr} AS unread FROM Session"):
                     uname = r["strUsrName"]
                     if not uname:
                         continue
@@ -97,9 +100,9 @@ def sync_v3(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
                     dname = name_by_user.get(uname) or uname
 
                     cur.execute("""
-                        INSERT OR REPLACE INTO sessions (username, type, display_name, last_time, last_msg_preview)
-                        VALUES (?, ?, ?, ?, ?)
-                    """, (uname, stype, dname, r["last_time"], r["summary"]))
+                        INSERT OR REPLACE INTO sessions (username, type, display_name, last_time, last_msg_preview, unread)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, (uname, stype, dname, r["last_time"], r["summary"], int(r["unread"] or 0)))
 
             c_conn.close()
         except Exception as e:

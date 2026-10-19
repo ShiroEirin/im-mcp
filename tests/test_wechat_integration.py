@@ -17,7 +17,7 @@ class TestRealHostEndToEnd(unittest.TestCase):
         cls.db_available = DB_PATH.exists()
 
     def test_registered_tools_count(self):
-        # 微信 MCP 必须完整对外注册 16 个核心工具
+        # 微信 MCP 必须完整对外注册 20 个核心工具
         tools = [t.name for t in mcp._tool_manager.list_tools()]
         expected_tools = [
             "search_wechat_messages",
@@ -27,6 +27,7 @@ class TestRealHostEndToEnd(unittest.TestCase):
             "get_message_image",
             "get_messages_by_date",
             "sync_wechat_database",
+            "start_sync",
             "search_contacts",
             "list_chatroom_members",
             "get_messages_by_range",
@@ -42,7 +43,7 @@ class TestRealHostEndToEnd(unittest.TestCase):
         ]
         for exp in expected_tools:
             self.assertIn(exp, tools)
-        self.assertEqual(len(tools), 19)
+        self.assertEqual(len(tools), 20)
 
     def test_sync_status_tool_structure(self):
         if not self.db_available:

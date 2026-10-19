@@ -15,6 +15,7 @@ from .auto_sync import (
     get_auto_sync_status as _auto_sync_status,
     restore_on_startup,
     set_auto_sync as _set_auto_sync,
+    start_sync as _start_sync,
     sync_now,
 )
 
@@ -532,18 +533,38 @@ def get_messages_by_date(date: str, session_id: Optional[str] = None, limit: int
 @mcp.tool()
 @_db_tool
 def sync_wechat_database(force: bool = False, redecrypt: bool = True) -> Dict[str, Any]:
-    """触发数据导入同步，使本地 MCP 数据库保持最新状态。
+    """触发数据导入同步，使本地 MCP 数据库保持最新状态（**阻塞**直到完成）。
 
     注意：绿泡泡数据库是加密的，本地索引读的是**解密快照**。只重建 ETL 读到的仍是旧
     快照（永远拿不到新消息），因此本工具默认会**先重新解密源库**再重建索引。
 
-    同步耗时取决于数据量（实测约 10–20 秒），期间调用会阻塞。
+    ⚠️ 耗时不固定：数据量小时几秒；解密快照接近 1GB 时「重新解密 + 重建索引」可能超过
+    100 秒。**调用方若对单次工具调用有硬超时（例如 120s），请改用 `start_sync`**
+    （后台执行，用 `get_auto_sync_status` 查结果），不要靠延长超时。
 
     Args:
         force: 是否强制全量重建索引（忽略指纹，默认 False）
         redecrypt: 是否先重新解密源库（默认 True；设为 False 则只重建索引）
     """
     return sync_now(force=force, redecrypt=redecrypt)
+
+
+@mcp.tool()
+@_db_tool
+def start_sync(force: bool = False, redecrypt: bool = True) -> Dict[str, Any]:
+    """在**后台**执行一次完整同步并立即返回（推荐给有调用超时的客户端）。
+
+    与 `sync_wechat_database` 的唯一区别是不阻塞等待结果：适合宿主/客户端对单次工具调用
+    有硬超时的场景（同步本身可能要 1–3 分钟，超时会被误报成失败）。
+
+    进度与结果查询：`get_auto_sync_status` 的 `syncing`（是否仍在跑）与 `last_run`
+    （上次结果、耗时、`run_count` 递增）。
+
+    Args:
+        force: 是否强制全量重建索引（忽略指纹，默认 False）
+        redecrypt: 是否先重新解密源库（默认 True；设为 False 则只重建索引）
+    """
+    return _start_sync(force=force, redecrypt=redecrypt)
 
 
 @mcp.tool()

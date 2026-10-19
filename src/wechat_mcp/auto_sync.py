@@ -563,13 +563,19 @@ def start_sync(force: bool = False, redecrypt: bool = True) -> Dict[str, Any]:
         except OSError:
             pass
         _clear_sync_state()
+        # 独立进程没能活过启动窗口（实测 Snow App 这类短连接宿主会在 MCP 进程退出时
+        # 把子进程一起带走，breakaway 也不一定生效）。这里**既不再谎报 started=true，
+        # 也不只丢一句 hint 让调用方干等超时** —— 直接回退到进程内**阻塞同步**：
+        # 本机实测一次完整同步 16–20s，远低于宿主 120s 上限，能保证「点了同步就真的会同步」。
+        logger.warning("独立同步进程未能存活（exit=%s），回退为阻塞同步", proc.poll())
+        result = sync_now(force=force, redecrypt=redecrypt)
         return {
-            "started": False,
-            "mode": "detached",
-            "error": "独立同步进程未能存活（宿主可能在 MCP 退出时终止了子进程）",
-            "hint": "请改用阻塞同步 sync_wechat_database（本机实测约 72s）。",
-            "exit_code": proc.poll(),
-            "log_tail": tail,
+            "started": True,
+            "mode": "blocking-fallback",
+            "error": "独立同步进程未能存活，已自动改为阻塞同步并执行完成。",
+            "detached_exit_code": proc.poll(),
+            "detached_log_tail": tail,
+            "result": result,
         }
 
     # 回退：进程内后台线程（长连接宿主，或 spawn 受限的环境）

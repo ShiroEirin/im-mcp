@@ -289,20 +289,31 @@ class TestManualSyncWorker(unittest.TestCase):
         self.assertEqual(res["mode"], "detached")
         self.assertEqual(res["pid"], _FakeProc.pid)
 
-    def test_start_sync_reports_failure_when_worker_dies(self):
-        """Popen 成功但 worker 未写出心跳 → 必须返回 started=false 并清掉残留。
+    def test_start_sync_falls_back_to_blocking_when_worker_dies(self):
+        """Popen 成功但 worker 未写出心跳 → 必须自动回退**阻塞同步**并给出结果。
 
-        真实故障（2026-10-19 实测）：短连接宿主会在 MCP 进程退出时终止 worker，
-        状态文件永不更新；旧实现只看到 Popen 成功就返回 started=true，调用方
-        只能干等超时。这里固定新的失败语义。
+        真实故障（2026-10-19 实测）：短连接宿主会在 MCP 进程退出时把 worker 一起带走，
+        sync_worker.log 0 字节、状态文件永不更新。旧实现只看到 Popen 成功就返回
+        started=true，调用方干等到超时；只改成返回 started=false 同样没解决问题
+        （同步根本没做）。这里固定新语义：回退进程内阻塞同步 —— 本机实测 16–20s，
+        远低于宿主 120s 上限。
         """
+        calls = []
+
+        def fake_sync_now(force=False, redecrypt=True):
+            calls.append((force, redecrypt))
+            return {"ok": True, "etl_step": {"status": "success", "messages": 1}}
+
         with patch.object(auto_sync, "_spawn_detached_worker", return_value=_FakeProc()), \
              patch.object(auto_sync, "_load_sync_state", return_value=None), \
-             patch.object(auto_sync, "WORKER_STARTUP_GRACE_SECONDS", 0.05):
+             patch.object(auto_sync, "WORKER_STARTUP_GRACE_SECONDS", 0.05), \
+             patch.object(auto_sync, "sync_now", side_effect=fake_sync_now):
             res = auto_sync.start_sync()
-        self.assertFalse(res["started"])
-        self.assertEqual(res["mode"], "detached")
+        self.assertTrue(res["started"])
+        self.assertEqual(res["mode"], "blocking-fallback")
         self.assertIn("未能存活", res["error"])
+        self.assertEqual(res["result"]["ok"], True)
+        self.assertEqual(len(calls), 1)
         self.assertFalse(self.sync_state.exists())
 
     def test_start_sync_falls_back_to_thread_when_spawn_fails(self):

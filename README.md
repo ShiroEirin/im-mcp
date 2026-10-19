@@ -37,7 +37,7 @@
 
 ### 1. 绿泡泡 (`wechat-mcp`)
 
-共 25 个工具，全部只读（`sync_wechat_database` / `start_sync` / `set_auto_sync` 会触发本地快照重建，但不向微信发送任何消息）。
+共 29 个工具，全部只读（`sync_wechat_database` / `start_sync` / `set_auto_sync` 会触发本地快照重建，但不向微信发送任何消息）。
 
 > 本 fork 相对上游新增 / 修复的完整清单见 [CHANGELOG.md](./CHANGELOG.md)。
 
@@ -72,6 +72,9 @@
 | `search_media_files` | 查找聊天中的图片 / 文件 / 视频及其磁盘路径 | “把群里发过的截图路径给我” |
 | `list_favorites` | 查询绿泡泡收藏条目（标题 / 描述 / 来源） | “我收藏过哪些资料” |
 | `list_emoticons` | 列出表情包与表情（含官方文字说明） | “那个‘偷听’表情在哪个包里” |
+| `prepare_emoticons` | 生成 / 刷新本地明文表情库（调用外部 `wxemo` 完成一次性 GPU 搜索，把 `business/emoticon` 下的账号级加密表情摊平成 `~/.wechat_mcp/emoticons/<md5>.<ext>`） | “让表情能直接出图” / 首次启用表情取图能力 |
+| `get_emoticon_image` | 按表情 md5 取本地明文表情图的文件路径（gif / png / jpg / webp / APNG；md5 来自消息返回的 `emoticon_md5`） | “把这条 `[表情]` 消息的那个表情图给我” |
+| `extract_image_key` | 从运行中的绿泡泡进程内存提取 **V2 图片解密密钥**并写入密钥文件（`image_aes_key` 字段）；需先在客户端点开 1-2 张图片再立刻调用 | “V2 聊天图片解密报缺 `image_aes_key`，把密钥取出来” |
 
 **分析与同步**
 
@@ -349,9 +352,11 @@ rm -rf ~/.wechat_mcp ~/.dingtalk_mcp
 │   │   ├── config.py
 │   │   ├── parser.py
 │   │   ├── database.py
+│   │   ├── images.py     # 聊天图片解密（XOR / V1 固定密钥 / V2 账号级密钥）
+│   │   ├── emoticons.py  # 自定义表情明文库（调用 wxemo 解密 + 按需 wxgf 转码）
 │   │   ├── server.py     # 绿泡泡 MCP 服务 (wechat-mcp)
 │   │   └── tools/        # 绿泡泡一键提取与解密 CLI (wechat-init)
-│   │       └── key_tool.py
+│   │       └── key_tool.py   # 密钥提取（DBKey / passphrase / 图片 V2 密钥）
 │   └── dingtalk_mcp/     # DuangDuang MCP 核心模块
 │       ├── decrypt.py    # V2/V3 AES-ECB + WAL 解密
 │       ├── db.py         # 128分表聚合查询与联系人实名映射

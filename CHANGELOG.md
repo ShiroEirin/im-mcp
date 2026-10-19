@@ -3,6 +3,68 @@
 本文件逐条记录本仓库相对上游 `stkoecn/im-mcp` 初始版本（v0.0.1）的全部改动，
 便于上游维护者对照 review（对应 PR #10）。所有改动均已实测复现后再修改。
 
+## 图片 V2 密钥提取、表情明文库与 `emoticon_md5` 贯通（绿泡泡工具 26 → 29 个）
+
+### 新增 MCP 工具（3 个）
+
+| 工具 | 说明 |
+|---|---|
+| `extract_image_key` | 从运行中的绿泡泡进程内存提取 V2 图片解密密钥，命中后写入密钥文件 `image_aes_key` 字段 |
+| `prepare_emoticons` | 生成 / 刷新本地明文表情库（调用外部 wxemo 完成一次性 GPU 搜索，产物摊平为 `~/.wechat_mcp/emoticons/<md5>.<ext>`） |
+| `get_emoticon_image` | 按表情 md5 取本地明文表情图的文件路径（gif / png / jpg / webp / APNG） |
+
+### V2 图片密钥提取（`key_tool.py` + `images.py`）
+
+- **V2 的密钥此前无处可取**：微信 4.x 聊天图片（`.dat`）有三代格式 —— 旧 XOR 格式可离线反推密钥、
+  V1 用固定常量 `cfcd208495d565ef`、**V2 的 AES-128-ECB 密钥是账号级的，只在该账号查看图片时临时缓存于
+  `Weixin.exe` 进程内存**，磁盘上没有任何副本（`all_keys.json` 里因此长期缺 `image_aes_key` 字段）。
+- **新增 `extract_image_key()`**：扫描微信进程可写内存区域里的「32 字符 alnum」候选，用真实 V2 文件的
+  密文块做**判定式**验证 —— 只有解出 JPEG/PNG/GIF/WEBP/wxgf 文件头才算命中，避免误报；命中后写入
+  密钥文件的 `image_aes_key` 字段。密钥只在查看图片时驻留内存，因此使用顺序是**先在客户端点开 1-2 张图片，
+  再立刻调用**；未命中时返回 `ok=false` 与原因，不谎报成功。
+- **内存读取原语抽成模块级函数**：`_win_read_mem` / `_win_enum_regions` 从原 `_scan_memory_raw_key`
+  的内部闭包提取出来复用，新增 `find_v2_cipher_sample` / `_image_key_hit` 配合判定式验证。
+- **`get_message_image` 增加自动提取 + 重试**：V2 缺密钥时**自动尝试提取一次**（每个 MCP 进程只试一次，
+  避免每张图都扫内存拖死面板），命中即落盘并重新解密；仍失败才回报原始错误。
+
+### 表情明文库（新增 `emoticons.py` + 两个工具）
+
+- **表情消息此前只能看到一个 `[表情]`**：微信 4.x 的自定义表情文件
+  （`business/emoticon/Persist/<两位>/<md5>:<ext>`、`cache/<月>/Emoticon/<两位>/<md5>`）用账号级密钥加密 ——
+  `key = MD5(f"{seed}{wxid}EMOTICON")`、`AES-128-CBC(key, iv=key)`；`seed` 落在 `0..2^32` 空间，
+  需要 GPU/SIMD 暴力搜索。这部分**委托外部工具 wxemo（https://github.com/azazo1/wxemo）**完成，
+  MCP 侧保持零加密依赖、零外部二进制调用。
+- **`prepare_emoticons()`**：调用 wxemo 把明文表情摊平成 `<md5>.<ext>` 扁平库，供 `get_emoticon_image`
+  按 md5 直查；`wxemo` 的定位顺序为环境变量 `WXEMO_BIN` → 约定目录 `~/.wechat_mcp/tools/wxemo/wxemo.exe` → PATH。
+- **wxgf 私有容器按需转码**：`wxgf` 是微信私有格式（内含 HEVC），渲染前需转码，且依赖微信自带的
+  `VoipEngine.dll`（自动从运行中的微信进程定位）。转码**不做批量**（1800+ 张要十分钟，是刻意取舍），
+  改为首次取用时按需转一个（首次约 1 秒，之后命中缓存）。
+- **表情库未准备时返回可操作提示而非报错**，并引导调用 `prepare_emoticons`。
+
+### ETL：`messages.emoticon_md5`
+
+- 新增 `messages.emoticon_md5` 列（含旧库自动 `ALTER TABLE` 迁移，列已存在时静默跳过），
+  `ETL_SCHEMA_VERSION` 6 → 7（版本号递增才能让老用户在源库未变时也走一次重建）。
+- md5 由 `parser.extract_emoticon_md5()` 从 zstd 解压后的原始 XML `<emoji ... md5="...">` 提取；
+  实测表情消息 md5 提取率 **31955/31957**。
+- **消息查询工具返回新增 `emoticon_md5` 字段**：`search_wechat_messages` / `get_session_history` /
+  `get_messages_by_date` / `get_messages_by_range` / `get_messages_since` 统一带上，面板据此直接调
+  `get_emoticon_image` 取图。纯新增字段，向后兼容。
+
+### 图片解密修复（`images.py`）
+
+- **V1 格式被误判为缺密钥（真 bug）**：V1 的 AES 密钥是**全局固定常量** `cfcd208495d565ef`（过渡期格式，
+  不随账号变化），与 V2 的账号级密钥不同 —— 本可离线解密。此前实现只要缺 `image_aes_key` 就一律报
+  `requires image_aes_key`，导致全部 V1 图片解密失败。现按 magic `\x07\x08V1\x08\x07` 分流，V1 直接使用
+  固定常量解密，不再受 `image_aes_key` 有无影响。
+
+### 测试与文档
+
+- 测试 **64 项全绿**；工具注册数断言由 27 更新为 **29**。
+- `README.md` 工具表补齐上述 3 个工具、工具总数更正为 29，并补列 `images.py` / `emoticons.py` 模块；
+  `skills/im-mcp/SKILL.md` 补齐 3 个工具用法与「图片 / 表情取不到时的排障顺序」。
+
+
 ## 真同步与定时同步（`auto_sync.py` + 两个新工具）
 
 - **`sync_wechat_database` 此前是「假同步」**：它只调用 `sync_data()`（重建 ETL），而索引

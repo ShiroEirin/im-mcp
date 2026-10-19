@@ -17,6 +17,9 @@ from .config import BASE_DIR, USER_WECHAT_DIR, get_decrypted_dir
 
 _V2_MAGIC_FULL = b"\x07\x08V2\x08\x07"
 _V1_MAGIC_FULL = b"\x07\x08V1\x08\x07"
+# V1 的 AES 密钥是全局固定常量（过渡期格式，不随账号变化），
+# 与 V2 的账号级密钥不同 —— 因此 V1 无需 image_aes_key 也能离线解密。
+_V1_FIXED_KEY = b"cfcd208495d565ef"
 
 def _find_image_dat_by_md5(md5: str, search_roots: list[Path]) -> Optional[Path]:
     """Search for image .dat file matching md5 under WeChat storage directories."""
@@ -117,6 +120,9 @@ def decrypt_image_dat(dat_path: Path, aes_key: Optional[bytes] = None) -> Tuple[
 
     # Case 1: V2 / V1 Format (AES-128-ECB + XOR)
     if head6 in (_V2_MAGIC_FULL, _V1_MAGIC_FULL):
+        if not aes_key and head6 == _V1_MAGIC_FULL:
+            # V1 用固定密钥即可解，不该因为缺 image_aes_key 而失败
+            aes_key = _V1_FIXED_KEY
         if not aes_key:
             return None, "", "WeChat 4.x V2 image encryption requires image_aes_key (not currently loaded)"
         
@@ -204,6 +210,47 @@ def decrypt_image_dat(dat_path: Path, aes_key: Optional[bytes] = None) -> Tuple[
         return full_img, "gif", None
 
     return None, "", "Unknown image dat encryption format"
+
+
+# ---------------------------------------------------------------------------
+# 图片 AES 密钥的读取与自动提取
+#
+# 微信 4.x V2 图片的密钥是账号级的，只在该账号查看图片时临时缓存于微信进程
+# 内存、磁盘上没有任何副本 —— 因此「缺密钥」是可自愈的：解密失败时自动扫一次
+# 内存（限时），命中即落盘，之后所有图片解密都直接可用，无需人工介入。
+#
+# 每个 MCP 进程只自动尝试一次：未命中说明此刻密钥不在内存（用户没刚看过图），
+# 继续对每张图各扫十几秒只会把面板拖死，不如快速失败并如实提示。
+# ---------------------------------------------------------------------------
+
+_AUTO_IMAGE_KEY_ATTEMPTED = False
+
+
+def _load_image_key(keys_path: Path) -> Optional[bytes]:
+    """从密钥文件读取 image_aes_key（缺失 / 损坏时返回 None）。"""
+    try:
+        import json
+        if not keys_path.exists():
+            return None
+        with open(keys_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        value = data.get("image_aes_key") if isinstance(data, dict) else None
+        return value.encode("ascii") if value else None
+    except Exception:  # noqa: BLE001 - 密钥文件异常按「没有密钥」处理
+        return None
+
+
+def _try_extract_image_key(max_seconds: float = 20.0) -> bool:
+    """自动尝试一次从微信进程内存提取图片密钥；本进程只试一次。"""
+    global _AUTO_IMAGE_KEY_ATTEMPTED
+    if _AUTO_IMAGE_KEY_ATTEMPTED:
+        return False
+    _AUTO_IMAGE_KEY_ATTEMPTED = True
+    try:
+        from .tools.key_tool import extract_image_key
+        return bool(extract_image_key(max_seconds=max_seconds).get("ok"))
+    except Exception:  # noqa: BLE001 - 自动提取失败不影响正常错误上报
+        return False
 
 
 def get_image_for_message(message_id: int, include_base64: bool = False) -> Dict[str, Any]:
@@ -315,20 +362,15 @@ def get_image_for_message(message_id: int, include_base64: bool = False) -> Dict
             "md5": target_md5
         }
 
-    # 3. Decrypt
-    # Try load image_aes_key if available
-    image_aes_key = None
-    if all_keys_path.exists():
-        try:
-            import json
-            with open(all_keys_path, "r", encoding="utf-8") as f:
-                k_data = json.load(f)
-                if "image_aes_key" in k_data and k_data["image_aes_key"]:
-                    image_aes_key = k_data["image_aes_key"].encode("ascii")
-        except Exception:
-            pass
-
+    # 3. Decrypt（缺 V2 密钥时先自动尝试一次内存提取，见 _try_extract_image_key）
+    image_aes_key = _load_image_key(all_keys_path)
     img_bytes, fmt, err = decrypt_image_dat(dat_file, aes_key=image_aes_key)
+
+    if err and "image_aes_key" in err and _try_extract_image_key():
+        # 自动提取成功：密钥已落盘，重读并重试一次
+        image_aes_key = _load_image_key(all_keys_path)
+        img_bytes, fmt, err = decrypt_image_dat(dat_file, aes_key=image_aes_key)
+
     if err:
         return {
             "error": err,

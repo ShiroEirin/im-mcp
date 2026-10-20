@@ -7,7 +7,11 @@ from typing import Any, Dict, List, Optional
 from mcp.server.fastmcp import FastMCP
 
 from dingtalk_mcp.db import DingTalkDB
-from dingtalk_mcp.decrypt import decrypt_dingtalk, detect_dingtalk_user
+from dingtalk_mcp.decrypt import (
+    decrypt_dingtalk,
+    decrypt_dingtalk_with_report,
+    detect_dingtalk_user,
+)
 
 mcp = FastMCP("dingtalk-mcp")
 
@@ -42,7 +46,7 @@ def get_db() -> DingTalkDB:
 
 @mcp.tool()
 def sync_dingtalk_data() -> str:
-    """Manually sync and decrypt latest data from DingTalk local files."""
+    """Manually sync and decrypt latest data from DingTalk local files with WAL validation."""
     global _db_instance
     decrypted_dir = os.environ.get(
         "DINGTALK_DECRYPTED_DIR",
@@ -52,9 +56,41 @@ def sync_dingtalk_data() -> str:
     if not data_dir or not uid:
         return "Error: Could not auto-detect DingTalk data directory or UID."
 
-    out_db = decrypt_dingtalk(data_dir, uid, ver, salt, decrypted_dir)
+    out_db, report = decrypt_dingtalk_with_report(data_dir, uid, ver, salt, decrypted_dir)
     _db_instance = DingTalkDB(out_db)
-    return f"DingTalk database successfully synced to {out_db}"
+
+    # 采样分表获取最新消息时间
+    latest_msg_time = None
+    try:
+        with _db_instance.get_connection() as conn:
+            tables = [
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'tbmsg_%'"
+                ).fetchall()
+            ]
+            max_ts = 0
+            for t in tables[:25]:
+                row = conn.execute(f"SELECT MAX(createdAt) FROM {t}").fetchone()
+                if row and row[0] and row[0] > max_ts:
+                    max_ts = row[0]
+            if max_ts > 0:
+                from datetime import datetime
+                latest_msg_time = datetime.fromtimestamp(max_ts / 1000.0).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+    except Exception:
+        pass
+
+    method = report.get("checkpoint_method", "none")
+    applied = report.get("wal_frames_applied", 0)
+    total = report.get("wal_frames_total", 0)
+
+    msg = f"DingTalk database successfully synced to {out_db} (checkpoint: {method}, wal_frames: {applied}/{total}"
+    if latest_msg_time:
+        msg += f", latest_msg: {latest_msg_time}"
+    msg += ")"
+    return msg
 
 
 @mcp.tool()

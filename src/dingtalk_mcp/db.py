@@ -65,6 +65,25 @@ def parse_message_content(content_raw: Any, content_type: int) -> Dict[str, Any]
         text = data["content"]
     elif "title" in data and data["title"]:
         text = str(data["title"])
+    elif "desc" in data and data["desc"]:
+        text = str(data["desc"])
+
+    # Parse root-level extension (e.g. 3100 todo/calendar, 501 file, etc.)
+    root_ext = data.get("extension")
+    root_ext_obj: Dict[str, Any] = {}
+    if isinstance(root_ext, str):
+        try:
+            root_ext_obj = json.loads(root_ext)
+        except Exception:
+            pass
+    elif isinstance(root_ext, dict):
+        root_ext_obj = root_ext
+
+    if root_ext_obj:
+        if not text and root_ext_obj.get("desc"):
+            text = str(root_ext_obj["desc"])
+        elif not text and root_ext_obj.get("title"):
+            text = str(root_ext_obj["title"])
 
     # Attachments
     attachments = data.get("attachments", [])
@@ -72,28 +91,43 @@ def parse_message_content(content_raw: Any, content_type: int) -> Dict[str, Any]
     if isinstance(attachments, list):
         for att in attachments:
             if isinstance(att, dict):
-                # Check markdown in extension (very common for rich messages / quoted messages in DingTalk)
+                # Check markdown or f_name in extension
                 ext = att.get("extension")
+                ext_obj: Dict[str, Any] = {}
                 if ext:
                     if isinstance(ext, str):
                         try:
                             ext_obj = json.loads(ext)
-                            if "markdown" in ext_obj and ext_obj["markdown"]:
-                                text = (text + "\n" if text else "") + ext_obj["markdown"]
-                            elif "title" in ext_obj and ext_obj["title"] and not text:
-                                text = ext_obj["title"]
                         except Exception:
                             pass
                     elif isinstance(ext, dict):
-                        if "markdown" in ext and ext["markdown"]:
-                            text = (text + "\n" if text else "") + ext["markdown"]
-                        elif "title" in ext and ext["title"] and not text:
-                            text = ext["title"]
+                        ext_obj = ext
+
+                if ext_obj:
+                    if "markdown" in ext_obj and ext_obj["markdown"]:
+                        text = (text + "\n" if text else "") + ext_obj["markdown"]
+                    elif "desc" in ext_obj and ext_obj["desc"] and not text:
+                        text = ext_obj["desc"]
+                    elif "title" in ext_obj and ext_obj["title"] and not text:
+                        text = ext_obj["title"]
+
+                    # DingTalk 501 file messages store filename in extension.f_name
+                    if "f_name" in ext_obj and ext_obj["f_name"]:
+                        fname = ext_obj["f_name"]
+                        fsize = ext_obj.get("f_size")
+                        files.append(f"{fname} ({fsize}B)" if fsize else fname)
 
                 fname = att.get("fileName") or att.get("title") or att.get("name")
                 fsize = att.get("size")
-                if fname:
+                if fname and not any(fname in f for f in files):
                     files.append(f"{fname} ({fsize}B)" if fsize else fname)
+
+    # Check root-level file info for contentType 501 if not found in attachments
+    if not files and root_ext_obj:
+        if "f_name" in root_ext_obj and root_ext_obj["f_name"]:
+            fname = root_ext_obj["f_name"]
+            fsize = root_ext_obj.get("f_size")
+            files.append(f"{fname} ({fsize}B)" if fsize else fname)
 
     if files and not text:
         text = f"[文件/附件] {', '.join(files)}"

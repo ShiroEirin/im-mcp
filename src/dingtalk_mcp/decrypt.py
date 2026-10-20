@@ -7,10 +7,11 @@ import logging
 import os
 import shutil
 import sqlite3
+import struct
 import sys
 import tempfile
 import re
-from typing import List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -217,8 +218,21 @@ def generate_key(uid: str, version: int = 2, salt_hex: Optional[str] = None) -> 
         return md5_hex[:16].encode("ascii")
 
 
-def decrypt_db_file(src_path: str, dst_path: str, key: bytes, is_wal: bool = False) -> None:
-    """Decrypt a DingTalk SQLite or WAL file page by page using AES-128-ECB."""
+def _wal_cksum(data: bytes, s0: int = 0, s1: int = 0, is_big_endian: bool = False) -> Tuple[int, int]:
+    """Compute SQLite WAL 32-bit checksum pair (s0, s1) over 8-byte steps."""
+    fmt = ">II" if is_big_endian else "<II"
+    for i in range(0, len(data), 8):
+        x0, x1 = struct.unpack(fmt, data[i : i + 8])
+        s0 = (s0 + x0 + s1) & 0xFFFFFFFF
+        s1 = (s1 + x1 + s0) & 0xFFFFFFFF
+    return s0, s1
+
+
+def decrypt_db_file(src_path: str, dst_path: str, key: bytes, is_wal: bool = False) -> int:
+    """Decrypt a DingTalk SQLite or WAL file page by page using AES-128-ECB.
+
+    Returns the number of frames decrypted if is_wal=True, else page count.
+    """
     from Crypto.Cipher import AES
 
     cipher = AES.new(key, AES.MODE_ECB)
@@ -227,6 +241,7 @@ def decrypt_db_file(src_path: str, dst_path: str, key: bytes, is_wal: bool = Fal
         data = f.read()
 
     result = bytearray()
+    count = 0
     if not is_wal:
         # Standard SQLite DB file: 4096-byte pages
         for offset in range(0, len(data), _AES_PAGE_SIZE):
@@ -234,21 +249,43 @@ def decrypt_db_file(src_path: str, dst_path: str, key: bytes, is_wal: bool = Fal
             if len(page) == _AES_PAGE_SIZE:
                 for i in range(0, _AES_PAGE_SIZE, 16):
                     result.extend(cipher.decrypt(page[i : i + 16]))
+                count += 1
             else:
                 result.extend(page)
     else:
-        # SQLite WAL file: 32-byte plaintext header, then frames (24-byte plaintext header + 4096-byte page)
+        # SQLite WAL file: 32-byte header + frames (24-byte header + 4096-byte page)
+        # Note: DingTalk WAL frames have their checksum calculated over CIPHERTEXT pages.
+        # SQLite rejects the WAL if the checksum does not match decrypted pages.
+        # We must recompute SQLite WAL checksums over the decrypted pages using the header magic endianness.
         if len(data) >= 32:
-            result.extend(data[:32])
+            hdr = bytearray(data[:32])
+            magic = struct.unpack(">I", hdr[:4])[0]
+            is_be = (magic & 1) == 1
+
+            # Recompute WAL header checksum (first 24 bytes)
+            s0, s1 = _wal_cksum(hdr[:24], 0, 0, is_big_endian=is_be)
+            hdr[24:32] = struct.pack(">II", s0, s1)
+            result.extend(hdr)
+
             frame_size = 24 + _AES_PAGE_SIZE
             for offset in range(32, len(data), frame_size):
                 frame = data[offset : offset + frame_size]
                 if len(frame) == frame_size:
-                    frame_header = frame[:24]
-                    page_data = frame[24:]
-                    result.extend(frame_header)
-                    for i in range(0, _AES_PAGE_SIZE, 16):
-                        result.extend(cipher.decrypt(page_data[i : i + 16]))
+                    fhdr = bytearray(frame[:24])
+                    enc_page = frame[24:]
+                    dec_page = bytearray()
+                    for j in range(0, _AES_PAGE_SIZE, 16):
+                        dec_page.extend(cipher.decrypt(enc_page[j : j + 16]))
+
+                    # Recompute checksum over frame header (first 8 bytes) + decrypted page
+                    a0, a1 = _wal_cksum(fhdr[:8], s0, s1, is_big_endian=is_be)
+                    b0, b1 = _wal_cksum(dec_page, a0, a1, is_big_endian=is_be)
+                    fhdr[16:24] = struct.pack(">II", b0, b1)
+                    s0, s1 = b0, b1
+
+                    result.extend(fhdr)
+                    result.extend(dec_page)
+                    count += 1
                 else:
                     result.extend(frame)
         else:
@@ -257,15 +294,16 @@ def decrypt_db_file(src_path: str, dst_path: str, key: bytes, is_wal: bool = Fal
     with open(dst_path, "wb") as f:
         f.write(result)
 
+    return count
 
-def _merge_wal_frames_into_db(db_path: str, enc_wal_path: str, cipher) -> None:
+
+def _merge_wal_frames_into_db(db_path: str, enc_wal_path: str, cipher) -> int:
     """Fallback merge: directly replay decrypted WAL frames into database pages.
 
     This handles cases where the host SQLite library refuses to checkpoint due to
-    WAL header checksum differences in encrypted/raw streams.
+    corrupted frames or unrecognized WAL state.
+    Returns the number of frames merged.
     """
-    import struct
-
     pages = {}
     with open(db_path, "rb") as f:
         db_data = f.read()
@@ -273,16 +311,18 @@ def _merge_wal_frames_into_db(db_path: str, enc_wal_path: str, cipher) -> None:
         pg = i // _AES_PAGE_SIZE + 1
         pages[pg] = db_data[i : i + _AES_PAGE_SIZE]
 
+    frames_applied = 0
     with open(enc_wal_path, "rb") as f:
         hdr = f.read(32)
         if len(hdr) < 32:
-            return
-        frame_size = 24 + _AES_PAGE_SIZE
+            return 0
+
         while True:
             fhdr = f.read(24)
             if len(fhdr) < 24:
                 break
-            pgno, commit, _, _, _, _ = struct.unpack(">IIIIII", fhdr)
+            # SQLite WAL frame header pgno and dbsize are always big-endian (>II)
+            pgno, dbsize = struct.unpack(">II", fhdr[:8])
             page_data = f.read(_AES_PAGE_SIZE)
             if len(page_data) < _AES_PAGE_SIZE:
                 break
@@ -290,9 +330,10 @@ def _merge_wal_frames_into_db(db_path: str, enc_wal_path: str, cipher) -> None:
             for j in range(0, _AES_PAGE_SIZE, 16):
                 dec_page.extend(cipher.decrypt(page_data[j : j + 16]))
             pages[pgno] = bytes(dec_page)
+            frames_applied += 1
 
     if not pages:
-        return
+        return 0
 
     max_p = max(pages.keys())
     with open(db_path, "wb") as f:
@@ -302,17 +343,20 @@ def _merge_wal_frames_into_db(db_path: str, enc_wal_path: str, cipher) -> None:
             else:
                 f.write(b"\x00" * _AES_PAGE_SIZE)
 
+    return frames_applied
 
-def decrypt_dingtalk(
+
+def decrypt_dingtalk_with_report(
     data_dir: str,
     uid: str,
     version: int,
     salt: Optional[str],
     output_dir: str,
-) -> str:
+) -> Tuple[str, Dict[str, Any]]:
     """Safely copy, decrypt and checkpoint DingTalk database into output_dir.
 
-    Returns the path to the decrypted dingtalk.db.
+    Returns:
+        (out_db_path, report_dict)
     """
     from Crypto.Cipher import AES
 
@@ -326,6 +370,14 @@ def decrypt_dingtalk(
 
     if not os.path.isfile(src_db):
         raise FileNotFoundError(f"dingtalk.db not found in {db_dir}")
+
+    report: Dict[str, Any] = {
+        "db_path": "",
+        "wal_frames_total": 0,
+        "wal_frames_applied": 0,
+        "checkpoint_method": "none",
+        "stale": False,
+    }
 
     # Copy to temp first to avoid locking
     temp_dir = tempfile.mkdtemp(prefix="dt_decrypt_")
@@ -361,19 +413,31 @@ def decrypt_dingtalk(
             )
 
         if has_wal:
-            decrypt_db_file(temp_enc_wal, out_wal, key, is_wal=True)
-            # Try SQLite native WAL checkpoint
+            total_frames = decrypt_db_file(temp_enc_wal, out_wal, key, is_wal=True)
+            report["wal_frames_total"] = total_frames
+
             checkpoint_ok = False
             try:
                 conn = sqlite3.connect(out_db)
-                conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-                # Verify if tables were imported
-                tbl_cnt = conn.execute(
-                    "SELECT count(*) FROM sqlite_master WHERE type='table';"
-                ).fetchone()[0]
+                # Use FULL checkpoint to get accurate log_frames and ckpt_frames before truncating
+                ckpt_res = conn.execute("PRAGMA wal_checkpoint(FULL);").fetchone()
+                if ckpt_res and len(ckpt_res) >= 3:
+                    busy, log_frames, ckpt_frames = ckpt_res[0], ckpt_res[1], ckpt_res[2]
+                    if total_frames == 0:
+                        checkpoint_ok = True
+                        report["checkpoint_method"] = "none"
+                        report["wal_frames_applied"] = 0
+                    elif busy == 0 and ckpt_frames == log_frames and log_frames > 0:
+                        checkpoint_ok = True
+                        report["checkpoint_method"] = "native"
+                        report["wal_frames_applied"] = ckpt_frames
+                        # Now truncate cleanly
+                        conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                    else:
+                        logger.warning(
+                            f"Native WAL checkpoint partial/busy/zero: busy={busy}, log={log_frames}, ckpt={ckpt_frames}, total={total_frames}"
+                        )
                 conn.close()
-                if tbl_cnt > 0:
-                    checkpoint_ok = True
             except Exception as e:
                 logger.warning(f"Native WAL checkpoint warning: {e}")
 
@@ -383,17 +447,34 @@ def decrypt_dingtalk(
             except OSError:
                 pass
 
-            # If native checkpoint produced 0 tables or failed due to WAL checksum mismatch,
-            # replay WAL frames directly to assemble the full database.
+            # If native checkpoint was not fully successful, fallback to manual frame reassembly
             if not checkpoint_ok:
                 logger.info("Applying direct WAL frame reassembly fallback...")
-                _merge_wal_frames_into_db(out_db, temp_enc_wal, cipher)
+                applied = _merge_wal_frames_into_db(out_db, temp_enc_wal, cipher)
+                report["checkpoint_method"] = "fallback"
+                report["wal_frames_applied"] = applied
                 if os.path.exists(out_wal):
                     try:
                         os.remove(out_wal)
                     except Exception:
                         pass
 
-        return out_db
+        report["db_path"] = out_db
+        return out_db, report
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def decrypt_dingtalk(
+    data_dir: str,
+    uid: str,
+    version: int,
+    salt: Optional[str],
+    output_dir: str,
+) -> str:
+    """Safely copy, decrypt and checkpoint DingTalk database into output_dir.
+
+    Returns the path to the decrypted dingtalk.db.
+    """
+    out_db, _ = decrypt_dingtalk_with_report(data_dir, uid, version, salt, output_dir)
+    return out_db

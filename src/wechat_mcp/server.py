@@ -238,8 +238,27 @@ def _member_aggregate(
         SELECT m.sender_username AS u,
                COALESCE(NULLIF(c.display_name, ''), m.sender_username) AS name,
                COUNT(*) AS messages,
-               COALESCE(SUM(LENGTH(COALESCE(m.content, ''))), 0) AS chars,
-               COALESCE(MAX(LENGTH(COALESCE(m.content, ''))), 0) AS longest,
+               -- 只算「自己说的话」：引用消息的 content 形如
+               --   "[引用 某某: 被引原文] 自己的回复"
+               -- 直接把 LENGTH(content) 求和会把被引原文也算进作者字数 ——
+               -- 实测某成员 104 条里 67 条是引用，6605 字中约 2480 字是别人的。
+               -- 这里剥掉第一个 ']' 及其之前的部分（引用前缀），ltrim 去掉残留空格。
+               COALESCE(SUM(
+                 CASE
+                   WHEN (m.local_type >> 32) = 57 AND instr(COALESCE(m.content, ''), ']') > 0
+                     THEN LENGTH(ltrim(substr(m.content, instr(m.content, ']') + 1)))
+                   ELSE LENGTH(COALESCE(m.content, ''))
+                 END
+               ), 0) AS chars,
+               -- 原值保留：用来区分「自己输出多」与「搬运引用的多」
+               COALESCE(SUM(LENGTH(COALESCE(m.content, ''))), 0) AS chars_total,
+               COALESCE(MAX(
+                 CASE
+                   WHEN (m.local_type >> 32) = 57 AND instr(COALESCE(m.content, ''), ']') > 0
+                     THEN LENGTH(ltrim(substr(m.content, instr(m.content, ']') + 1)))
+                   ELSE LENGTH(COALESCE(m.content, ''))
+                 END
+               ), 0) AS longest,
                SUM(CASE WHEN (m.local_type & {_BASE_TYPE_MASK}) = 3 OR (m.local_type >> 32) = 3 THEN 1 ELSE 0 END) AS images,
                SUM(CASE WHEN (m.local_type >> 32) = 6 THEN 1 ELSE 0 END) AS files,
                SUM(CASE WHEN (m.local_type & {_BASE_TYPE_MASK}) = 43 OR (m.local_type >> 32) = 4 THEN 1 ELSE 0 END) AS videos,
@@ -1994,8 +2013,23 @@ def get_member_profile(
     summary = cur.execute(
         f"""
         SELECT COUNT(*) AS messages,
-               COALESCE(SUM(LENGTH(COALESCE(m.content, ''))), 0) AS chars,
-               COALESCE(MAX(LENGTH(COALESCE(m.content, ''))), 0) AS longest,
+               -- 与 _member_aggregate 同口径：引用消息只算「自己回复的那部分」，
+               -- 否则被引原文会被算进本人字数（称号「话痨之王」会失真）。
+               COALESCE(SUM(
+                 CASE
+                   WHEN (m.local_type >> 32) = 57 AND instr(COALESCE(m.content, ''), ']') > 0
+                     THEN LENGTH(ltrim(substr(m.content, instr(m.content, ']') + 1)))
+                   ELSE LENGTH(COALESCE(m.content, ''))
+                 END
+               ), 0) AS chars,
+               COALESCE(SUM(LENGTH(COALESCE(m.content, ''))), 0) AS chars_total,
+               COALESCE(MAX(
+                 CASE
+                   WHEN (m.local_type >> 32) = 57 AND instr(COALESCE(m.content, ''), ']') > 0
+                     THEN LENGTH(ltrim(substr(m.content, instr(m.content, ']') + 1)))
+                   ELSE LENGTH(COALESCE(m.content, ''))
+                 END
+               ), 0) AS longest,
                MIN(m.create_time) AS first_time,
                MAX(m.create_time) AS last_time,
                COUNT(DISTINCT strftime('%Y-%m-%d', datetime(m.create_time / {divisor}, 'unixepoch', 'localtime'))) AS active_days,
@@ -2116,7 +2150,10 @@ def get_member_profile(
         "time_range": {"start": start, "end": end} if (start and end) else None,
         "summary": {
             "messages": messages,
+            # chars = 自己说的话（已剥掉引用前缀）；chars_total = 含被引原文的总长度。
+            # 两者差得越多，说明这个人越偏向「搬运 / 转引」而不是自己输出。
             "chars": chars,
+            "chars_total": int(summary["chars_total"] or 0),
             "avg_length": round(chars / messages, 1) if messages else 0.0,
             "longest": int(summary["longest"] or 0),
             "first_time": _ts_to_str(summary["first_time"]),

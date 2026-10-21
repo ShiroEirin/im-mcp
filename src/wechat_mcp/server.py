@@ -5,7 +5,7 @@ import re
 import sqlite3
 from collections import Counter
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Sequence
 
 from mcp.server.fastmcp import FastMCP
 
@@ -307,8 +307,21 @@ def _member_aggregate(
                0 AS recall_like_events,
                SUM(CASE WHEN CAST(strftime('%H', datetime(m.create_time / {divisor}, 'unixepoch', 'localtime')) AS INTEGER) < 6 THEN 1 ELSE 0 END) AS night,
                SUM(CASE WHEN CAST(strftime('%H', datetime(m.create_time / {divisor}, 'unixepoch', 'localtime')) AS INTEGER) BETWEEN 6 AND 8 THEN 1 ELSE 0 END) AS early,
-               -- 早起冠军用：早晨 6-8 点之间「最早那条发言」的时刻（秒），没在早晨说过话则为 NULL。
-               -- 与 early（条数）区分 —— 比条数只能得出「谁早晨话多」，不是「谁起得早」。
+               -- 后半夜（00:00–02:59）：比 night（0–6 点）更聚焦，用于区分「熬夜」与「晚睡」
+               SUM(CASE WHEN CAST(strftime('%H', datetime(m.create_time / {divisor}, 'unixepoch', 'localtime')) AS INTEGER) < 3 THEN 1 ELSE 0 END) AS midnight,
+               -- 周末 / 工作日拆分（SQLite strftime('%w')：0=周日、6=周六）
+               SUM(CASE WHEN strftime('%w', datetime(m.create_time / {divisor}, 'unixepoch', 'localtime')) IN ('0', '6') THEN 1 ELSE 0 END) AS weekend,
+               SUM(CASE WHEN strftime('%w', datetime(m.create_time / {divisor}, 'unixepoch', 'localtime')) NOT IN ('0', '6') THEN 1 ELSE 0 END) AS weekday_only,
+               -- 感叹号 / 问号总数（全角 + 半角）：原长 - 去掉标点后的长度
+               SUM(
+                 LENGTH(COALESCE(m.content, '')) - LENGTH(
+                   REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(m.content, ''), '！', ''), '？', ''), '!', ''), '?', '')
+                 )
+               ) AS puncts,
+               -- @ 出现次数（含引用前缀里的，属可接受近似）
+               SUM(LENGTH(COALESCE(m.content, '')) - LENGTH(REPLACE(COALESCE(m.content, ''), '@', ''))) AS mentions,
+               -- 早晨 6-8 点之间「最早那条发言」的时刻（秒），没在早晨说过话则为 NULL。
+               -- 与 early（条数）区分 —— 条数只反映「早晨说得多」，不反映「谁先开口」。
                MIN(CASE WHEN CAST(strftime('%H', datetime(m.create_time / {divisor}, 'unixepoch', 'localtime')) AS INTEGER) BETWEEN 6 AND 8 THEN m.create_time / {divisor} END) AS early_first,
                MIN(m.create_time) AS first_time,
                MAX(m.create_time) AS last_time
@@ -345,6 +358,83 @@ def _member_bursts(
         list(params) + [threshold_seconds * divisor],
     ).fetchall()
     return {r["u"]: int(r["bursts"] or 0) for r in rows}
+
+
+def _member_topic_enders(
+    cur: sqlite3.Cursor,
+    where_sql: str,
+    params: List[Any],
+    divisor: int,
+    idle_minutes: int = 30,
+) -> Dict[str, int]:
+    """统计每人「发言后无人接话」的次数（话题终结）。
+
+    用 LEAD 取「下一条消息」的时间差；范围内最后一条也算一次（之后确实没人说话了）。
+    只统计人发的消息（排除群自身提示），否则系统提示会打断判断。
+    """
+    rows = cur.execute(
+        f"""
+        WITH seq AS (
+            SELECT m.sender_username AS u,
+                   m.create_time AS t,
+                   LEAD(m.create_time) OVER (ORDER BY m.create_time, m.id) AS nt
+            FROM messages m WHERE {where_sql} AND {_SELF_SENDER_FILTER}
+        )
+        SELECT u, SUM(CASE WHEN nt IS NULL OR nt - t >= ? THEN 1 ELSE 0 END) AS n
+        FROM seq GROUP BY u
+        """,
+        list(params) + [idle_minutes * 60 * divisor],
+    ).fetchall()
+    return {r["u"]: int(r["n"] or 0) for r in rows}
+
+
+def _member_repeats(
+    cur: sqlite3.Cursor,
+    where_sql: str,
+    params: List[Any],
+) -> Dict[str, int]:
+    """统计每人「与紧邻上一条内容完全相同」的次数（复读行为）。
+
+    不区分是谁发的 —— 跟着别人复读也算（这正是复读的本意）。
+    """
+    rows = cur.execute(
+        f"""
+        WITH seq AS (
+            SELECT m.sender_username AS u,
+                   m.content AS c,
+                   LAG(m.content) OVER (ORDER BY m.create_time, m.id) AS pc
+            FROM messages m WHERE {where_sql} AND {_SELF_SENDER_FILTER}
+        )
+        SELECT u, SUM(CASE WHEN c = pc AND COALESCE(c, '') <> '' THEN 1 ELSE 0 END) AS n
+        FROM seq GROUP BY u
+        """,
+        params,
+    ).fetchall()
+    return {r["u"]: int(r["n"] or 0) for r in rows}
+
+
+def _member_first_of_day(
+    cur: sqlite3.Cursor,
+    where_sql: str,
+    params: List[Any],
+    divisor: int,
+) -> Dict[str, int]:
+    """统计每人「当天第一个开口」的次数（按本地日期分组，取当天最早一条的发送者）。"""
+    rows = cur.execute(
+        f"""
+        WITH ranked AS (
+            SELECT m.sender_username AS u,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY strftime('%Y-%m-%d', datetime(m.create_time / {divisor}, 'unixepoch', 'localtime'))
+                       ORDER BY m.create_time, m.id
+                   ) AS rn
+            FROM messages m WHERE {where_sql} AND {_SELF_SENDER_FILTER}
+        )
+        SELECT u, COUNT(*) AS n FROM ranked WHERE rn = 1 GROUP BY u
+        """,
+        params,
+    ).fetchall()
+    return {r["u"]: int(r["n"] or 0) for r in rows}
 
 
 def _quote_network(
@@ -560,27 +650,65 @@ def _concentration(members: List[Dict[str, Any]], top_n: int) -> Dict[str, Any]:
     }
 
 
+# 领跑者榜的维度不在此处维护清单：凡聚合行里值为 int 的列自动成为「越多越靠前」
+# 的榜单维度，新增聚合列无需回改本文件。只有两类例外：
+#   - 首次发言时间戳：语义是「什么时候第一次说话」，不是某种行为的多寡，不参与榜单。
+#   - 时间类维度：值越小越靠前（谁最先 / 谁最后收手），且需要附带 HH:MM 标签。
+_LEADER_EXCLUDE = frozenset({"first_time"})
+_LEADER_ASCENDING = frozenset({"early_first", "last_time"})
+
+
+def _leader_field_names(members: List[Dict[str, Any]]) -> List[str]:
+    """从成员聚合行自动发现可作为榜单的数值维度。
+
+    聚合行由同一条 SQL 产生，列结构固定，取第一行的键即可。bool 是 int 的子类，
+    必须先排除，否则布尔列会被误当成计数维度。
+    """
+    if not members:
+        return []
+    return [
+        key
+        for key, value in members[0].items()
+        if key not in _LEADER_EXCLUDE
+        and not isinstance(value, bool)
+        and isinstance(value, int)
+    ]
+
+
 def _member_payload(
     rows: List[sqlite3.Row],
     top_n: int,
     quoted: Optional[Counter] = None,
     bursts: Optional[Dict[str, int]] = None,
     recalls: Optional[Counter] = None,
+    enders: Optional[Dict[str, int]] = None,
+    repeats: Optional[Dict[str, int]] = None,
+    firsts: Optional[Dict[str, int]] = None,
+    leader_fields: Optional[Sequence[str]] = None,
 ) -> tuple:
     """把聚合行转成可消费的成员列表，并给出各维度领跑者。
 
     被引用次数与撤回次数都只能按显示名匹配（引用 / 撤回提示不含稳定 ID），
-    同名用户会合并计数。
+    同名用户会合并计数。话题终结 / 复读 / 首发言由独立 CTE 扫描得到。
+
+    ``leader_fields`` 默认按聚合行自动发现；调用方也可以显式指定子集，
+    用于只关心部分维度的场景（例如单次报告只要发言与字数两榜）。
     """
     quoted = quoted or Counter()
     bursts = bursts or {}
     recalls = recalls or Counter()
+    enders = enders or {}
+    repeats = repeats or {}
+    firsts = firsts or {}
     members: List[Dict[str, Any]] = []
     for row in rows:
         item = dict(row)
         item["quoted"] = int(quoted.get(item.get("name") or "", 0))
         item["bursts"] = int(bursts.get(item.get("u"), 0))
         item["recall_like_events"] = int(recalls.get(item.get("name") or "", 0))
+        item["topic_enders"] = int(enders.get(item.get("u"), 0))
+        item["repeats"] = int(repeats.get(item.get("u"), 0))
+        item["first_of_day"] = int(firsts.get(item.get("u"), 0))
         members.append(item)
 
     def leaders(field: str, size: int = 3, reverse: bool = True) -> List[Dict[str, Any]]:
@@ -588,8 +716,8 @@ def _member_payload(
 
         并列时以 username 作次键，保证结果**确定性且与消息数无关** —— 此前用
         Python 稳定排序，并列会继承 members 的 ``ORDER BY messages DESC`` 顺序，
-        等于「谁话多谁当冠军」。实测：全群仅 2 条视频时，两名各 1 条视频的
-        成员由消息数决定谁被封「视频UP主」，且结果永远固定为同一人。
+        等于「谁消息多谁当该维度第一」。实测：全群仅 2 条视频时，两名各 1 条视频的
+        成员由消息数决定谁是第一，且结果永远固定为同一人。
         """
         rows = [m for m in members if (m.get(field) or 0) > 0]
         if reverse:
@@ -603,26 +731,29 @@ def _member_payload(
                 "display_name": m["name"],
                 "value": m[field],
             }
-            # 与下一名同值即为并列：冠军不唯一，面板据此不颁发称号
+            # 与下一名同值即为并列：冠军不唯一，调用方据此判断是否并列
             nxt = rows[idx + 1] if idx + 1 < len(rows) else None
             item["tied"] = bool(nxt is not None and (nxt.get(field) or 0) == (m.get(field) or 0))
-            if field == "early_first":
-                # 时间戳对调用方不直观，附带 HH:MM 供直接展示
+            if field in _LEADER_ASCENDING:
+                # 时间戳对调用方不直观，附带 HH:MM 供直接展示。
+                # 注意 last_time 来自 MAX(create_time) 未除 divisor，可能是毫秒也可能已是秒。
                 try:
-                    item["label"] = datetime.datetime.fromtimestamp(int(m[field])).strftime("%H:%M")
+                    ts = int(m[field])
+                    if ts > 10 ** 12:  # 毫秒 → 秒
+                        ts //= 1000
+                    item["label"] = datetime.datetime.fromtimestamp(ts).strftime("%H:%M")
                 except (ValueError, OSError, OverflowError):
                     item["label"] = ""
             out.append(item)
         return out
 
-    leader_fields = (
-        "messages", "chars", "images", "videos", "emojis",
-        "quotes_given", "quoted", "recall_like_events", "night", "early", "bursts",
-    )
-    result = {field: leaders(field) for field in leader_fields}
-    # 早起冠军：按时刻升序（最早者在前），与 early（6-8 点条数）语义不同
-    result["early_first"] = leaders("early_first", reverse=False)
-    return members[:top_n], result
+    fields = tuple(leader_fields) if leader_fields else tuple(_leader_field_names(members))
+    # 时间类维度取「最早」（升序），其余取「最多」（降序）。
+    # early_first 是早晨最早发言时刻，与 early（6-8 点条数）语义不同：
+    # 条数只反映「说得多」，时刻才反映「谁先开口」。
+    return members[:top_n], {
+        field: leaders(field, reverse=field not in _LEADER_ASCENDING) for field in fields
+    }
 
 
 def _dedupe_phrases(phrases, min_count: int = 3, scan: int = 200, limit: int = 20) -> List[Dict[str, Any]]:
@@ -644,6 +775,106 @@ def _dedupe_phrases(phrases, min_count: int = 3, scan: int = 200, limit: int = 2
         if len(result) >= limit:
             break
     return result
+
+
+# ---- 群热词的停用词过滤 ----
+# 不做过滤时，n-gram 的 Top20 全是「不是 / 这个 / 一个 / 现在 / 就是 / 没有」
+# 这类纯语法虚词，热词榜会毫无信息量（实测）。
+_CN_STOP_PHRASES = frozenset(
+    """
+这个 那个 这些 那些 这种 那种 这样 那样 这里 那里 哪儿 哪个
+什么 怎么 为什么 怎么样 如何 是否 不是 就是 还是 只是 总是 也是 都是
+没有 不会 不能 不要 不用 不再 不同 不过 别的 一下子
+现在 已经 曾经 刚才 马上 立刻 突然 终于 一直 经常 偶尔 有时候
+可以 应该 需要 可能 也许 大概 必须 一定 肯定 确实 其实
+因为 所以 但是 而且 虽然 如果 然后 或者 以及 并且 既然 于是
+感觉 觉得 知道 认为 意思 时候 东西 事情 问题 地方 样子 情况
+一个 一下 一点 一些 一样 一起 一般 一切 一定 一直
+真的 反正 到底 究竟 毕竟 居然 竟然 难道 不是吧
+我们 你们 他们 她们 它们 咱们 大家 自己 别人 人家
+直接 之前 之后 出来 起来 下来 过来 进来 回去 上去 下来
+用的 用了 的话 来说 来看 一是 二是 就是 还是 这是 那是
+个月 小时 分钟 一天 一年 一次 一点 两个 三个
+不知道 不行 不对 不好 不能 不要 不用
+来了 去了 走了 好了 算了 完了 到了 找到 看到 想到
+东西 事儿 玩意 这些 那些
+不知 的时 不如 有人 有点 了吗 大模 的时候 的时
+""".split()
+)
+
+# 单字停用字：一个 2-4 字 n-gram 若**全部**由这些字组成，视为无实义
+_CN_STOP_CHARS = frozenset(
+    "的了是在我你他她它们和与或而且但就也都很不没有会要能可把被让给对从到上下里外中后前"
+    "这那哪谁什么怎样些个一二三四五六七八九十百千万亿"
+    "啊吧呢嘛哦呀哈嗯唉哎诶哇噢喔嘿呵嘻"
+    "很太最更再又还才只光越挺蛮特超真好多少大小"
+)
+
+_EN_STOP_WORDS = frozenset(
+    "the and for you are but not with this that from have has had was were "
+    "can could will would should may might must just like what when where who "
+    "why how all any get got out one two new now use see way yes yeah ok okay "
+    "our their his her its they them then than there here about into over".split()
+)
+
+
+def _group_phrases(
+    cur: sqlite3.Cursor,
+    where_sql: str,
+    params: List[Any],
+    limit: int = 30,
+    scan_limit: int = 20000,
+    min_count: int = 5,
+) -> List[Dict[str, Any]]:
+    """群级高频短语（热词榜）。
+
+    与 ``get_persona_style`` 同一套算法：中文按 2-4 字 n-gram、英文/数字按完整词，
+    再用 ``_dedupe_phrases`` 去掉被更长短语覆盖的碎片（「猫老」会被「猫老板」吸收）。
+
+    性能：n-gram 是 O(文本长度)，年报级别（数十万条）不能全量扫，因此按时间倒序
+    截断到 ``scan_limit`` 条 —— 热词反映的是「最近怎么说话」，截断对结果影响很小。
+    """
+    rows = cur.execute(
+        f"""
+        SELECT m.content AS content FROM messages m
+        WHERE {where_sql} AND {_SELF_SENDER_FILTER} AND COALESCE(m.content, '') <> ''
+        ORDER BY m.create_time DESC LIMIT ?
+        """,
+        list(params) + [int(scan_limit)],
+    ).fetchall()
+
+    phrases: Counter = Counter()
+    for item in rows:
+        text = item["content"] or ""
+        # 引用消息只统计作者自己写的那段（与 chars 口径一致，避免把被引原文算进来）
+        if text.startswith("[引用") and "]" in text:
+            text = text.split("]", 1)[1]
+        # 去掉 [图片] / [表情] 这类占位符，避免污染词频
+        text = re.sub(r"\[[^\]]{1,12}\]", " ", text)
+        for chunk in re.findall(r"[\u4e00-\u9fff]+", text):
+            for n in (2, 3, 4):
+                for i in range(len(chunk) - n + 1):
+                    # 这里**不做**停用词过滤：先让「不知道」「的时候」这类完整短语
+                    # 进入候选，_dedupe_phrases 才能吸收掉「不知」「的时」这样的碎片。
+                    phrases[chunk[i : i + n]] += 1
+        for word in re.findall(r"[A-Za-z0-9]{2,}", text):
+            phrases[word.lower()] += 1
+
+    # 先按 n-gram 去碎片，再过滤停用词成品。
+    # 顺序反了会留下「不知」「的时」这类残片 —— 因为它们的父短语已被提前砍掉，
+    # 没有人能吸收它们（实测：顺序错误时 Top20 里仍有「不知 x79」「的时 x76」）。
+    deduped = _dedupe_phrases(phrases, min_count=min_count, scan=600, limit=limit * 4)
+    out: List[Dict[str, Any]] = []
+    for item in deduped:
+        phrase = item["phrase"]
+        if phrase in _CN_STOP_PHRASES or phrase in _EN_STOP_WORDS:
+            continue
+        if all(ch in _CN_STOP_CHARS for ch in phrase):
+            continue
+        out.append(item)
+        if len(out) >= limit:
+            break
+    return out
 
 
 @mcp.tool()
@@ -1825,8 +2056,14 @@ def _activity_stats_payload(
     bursts = _member_bursts(cur, where_sql, params, divisor)
     quote_payload, quoted_counter = _quote_network(cur, where_sql, params, top_n)
     recalls = _recall_counts(cur, where_sql, params)
+    # 行为维度：话题终结 / 复读 / 当日首发言 —— 需要按时间序列扫描，单独查询
+    enders = _member_topic_enders(cur, where_sql, params, divisor)
+    repeats = _member_repeats(cur, where_sql, params)
+    firsts = _member_first_of_day(cur, where_sql, params, divisor)
+    # 群级热词榜：复用 n-gram + 去碎片算法（此前只有成员级口头禅，没有群级）
+    top_phrases = _group_phrases(cur, where_sql, params)
     member_rank, member_leaders = _member_payload(
-        member_rows, top_n, quoted_counter, bursts, recalls
+        member_rows, top_n, quoted_counter, bursts, recalls, enders, repeats, firsts
     )
     concentration = _concentration([dict(row) for row in member_rows], top_n)
     silent = _silent_members(cur, where_sql, params, session_id, top_n)
@@ -1888,6 +2125,8 @@ def _activity_stats_payload(
             {"weekday": int(r["w"]), "hour": r["h"], "count": r["n"]} for r in weekday_hourly
         ],
         "type_distribution": type_distribution,
+        # 群级热词榜（Top 30 短语，已按 n-gram 去碎片）
+        "top_phrases": top_phrases,
         "top_senders": [
             {"display_name": r["name"], "username": r["username"], "message_count": r["n"]}
             for r in top_senders
@@ -1920,12 +2159,19 @@ def get_chat_activity_stats(
         - ``daily_trend``：按天消息量 + 7 日移动平均 + 日环比
         - ``sessionization``：按静默间隔切分的会话片段（仅指定 session_id 时）
         - ``concentration``：基尼系数 / HHI / Top-N 份额
-        - ``member_rank``：成员多维聚合（发言、字数、图片、视频、表情、引用、
-          被引用、撤回类系统事件、深夜、早起、连发、首末发言时间）
-        - ``member_leaders``：各维度领跑者（Top 3）
+        - ``member_rank``：成员多维聚合。计数字段含发言、字数（``chars`` 只算
+          本人写的，``chars_total`` 含被引原文）、最长单条、图片 / 文件 / 视频 /
+          表情、发出引用与被引用、撤回类系统事件、深夜（0-6 点）、后半夜
+          （0-3 点）、早起（6-8 点）、周末 / 工作日、标点（！？）、@ 提及、
+          连发、话题终结、复读、当日首发言，以及首末发言时间。
+        - ``member_leaders``：各维度领跑者（Top 3）。维度**由上面的聚合列自动
+          发现** —— 凡值为整数的列都出一个榜，新增聚合列无需改榜单代码。
+          时间类维度按「最早」排序并附带 ``label``（HH:MM）；并列时 ``tied`` 为真。
         - ``silent_members``：群成员活跃率与沉默成员（仅群聊）
         - ``quote_network``：引用关系边与被引用榜（按显示名，含解析率）
         - ``system_events``：撤回类消息与系统提示消息数量/占比
+        - ``top_phrases``：群级高频短语榜（中文 2-4 字 n-gram + 英文词，已去
+          n-gram 碎片并过滤虚词），反映「最近在聊什么」，与单个成员的风格无关
 
     Args:
         session_id: 可选，限定某个群聊或联系人（不传则统计全部会话）
@@ -2067,7 +2313,7 @@ def get_member_profile(
         f"""
         SELECT COUNT(*) AS messages,
                -- 与 _member_aggregate 同口径：引用消息只算「自己回复的那部分」，
-               -- 否则被引原文会被算进本人字数（称号「话痨之王」会失真）。
+               -- 否则被引原文会被算进本人字数（字数榜会失真）。
                COALESCE(SUM(
                  CASE
                    WHEN (m.local_type >> 32) = 57 AND instr(COALESCE(m.content, ''), ']') > 0
@@ -2206,7 +2452,7 @@ def get_member_profile(
         "summary": {
             "messages": messages,
             # chars = 自己说的话（已剥掉引用前缀）；chars_total = 含被引原文的总长度。
-            # 两者差得越多，说明这个人越偏向「搬运 / 转引」而不是自己输出。
+            # 两者差得越多，说明这个人的输出越偏向转引而非自己写。
             "chars": chars,
             "chars_total": int(summary["chars_total"] or 0),
             "avg_length": round(chars / messages, 1) if messages else 0.0,

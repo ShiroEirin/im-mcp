@@ -185,6 +185,28 @@ class TestRecallAttribution(unittest.TestCase):
         self.assertEqual(by_name["李四"]["recall_like_events"], 0)
         self.assertEqual(leaders["recall_like_events"][0]["display_name"], "张三")
 
+    def test_member_payload_discovers_leader_fields_from_rows(self):
+        """榜单维度应自动跟随聚合列，不能在 server.py 里另维护一份清单。"""
+        from collections import Counter
+
+        from wechat_mcp.server import _member_payload
+
+        rows = [
+            {"u": "wxid_a", "name": "甲", "messages": 3, "chars": 10, "first_time": 100},
+            {"u": "wxid_b", "name": "乙", "messages": 1, "chars": 99, "first_time": 50},
+        ]
+        _, leaders = _member_payload(rows, 10, quoted=Counter())
+        # 数值列自动成为榜单维度
+        self.assertIn("messages", leaders)
+        self.assertIn("chars", leaders)
+        self.assertEqual(leaders["chars"][0]["display_name"], "乙")
+        # 首次发言时间戳语义不同，不参与榜单
+        self.assertNotIn("first_time", leaders)
+
+        # 调用方可以只订阅部分维度
+        _, subset = _member_payload(rows, 10, leader_fields=["messages"])
+        self.assertEqual(list(subset), ["messages"])
+
 
 if __name__ == "__main__":
     unittest.main()

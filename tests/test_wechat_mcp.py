@@ -114,5 +114,99 @@ class TestDatabaseSchema(unittest.TestCase):
                 conf.DB_PATH = orig_db_path
 
 
+class TestRecallAttribution(unittest.TestCase):
+    """撤回次数必须算在「被撤回人」头上，而不是「发过含撤回字样消息的人」。
+
+    撤回提示的 sender_username 是群自身（session_username）：旧口径按发言人做
+    `content LIKE '%撤回%'` 统计，结果是真正的撤回一条都归不到人，反而把
+    「聊天里提到撤回」的成员算成撤回冠军（阈值 >0，会在榜单上永久霸榜）。
+    """
+
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute(
+            """
+            CREATE TABLE messages (
+                sender_username TEXT,
+                session_username TEXT,
+                content TEXT,
+                local_type INTEGER,
+                create_time INTEGER
+            )
+            """
+        )
+        self.session = "123@chatroom"
+        self.conn.executemany(
+            "INSERT INTO messages VALUES (?, ?, ?, ?, ?)",
+            [
+                # 真正的撤回提示：发送者是群自身
+                (self.session, self.session, '"张三" 撤回了一条消息', 10000, 1),
+                (self.session, self.session, '"张三" 撤回了一条消息', 10000, 2),
+                (self.session, self.session, '"李四" 撤回了一条消息', 10002, 3),
+                (self.session, self.session, "你撤回了一条消息", 10000, 4),
+                # 干扰项：真人聊天里正常提到「撤回」
+                ("wxid_a", self.session, "他撤回了对 bukkit 的代码授权", 1, 5),
+                ("wxid_a", self.session, "[引用 张三: 撤回了] 对啊", 244813135921, 6),
+            ],
+        )
+        self.conn.commit()
+
+    def tearDown(self):
+        self.conn.close()
+
+    def test_counts_go_to_revoked_member_not_mentioner(self):
+        from wechat_mcp.server import _recall_counts
+
+        counts = _recall_counts(
+            self.conn.cursor(), "m.session_username = ?", [self.session]
+        )
+        self.assertEqual(counts["张三"], 2)
+        self.assertEqual(counts["李四"], 1)
+        # 「你撤回了一条消息」拿不到昵称，保守跳过
+        self.assertNotIn("你", counts)
+        # 正常聊天里提到「撤回」不计入
+        self.assertEqual(sum(counts.values()), 3)
+
+    def test_member_payload_injects_recall_counts(self):
+        from collections import Counter
+
+        from wechat_mcp.server import _member_payload
+
+        rows = [
+            {"u": "wxid_zhang", "name": "张三", "messages": 10},
+            {"u": "wxid_li", "name": "李四", "messages": 5},
+        ]
+        payload, leaders = _member_payload(
+            rows, 10, quoted=Counter(), bursts={}, recalls=Counter({"张三": 2})
+        )
+        by_name = {m["name"]: m for m in payload}
+        self.assertEqual(by_name["张三"]["recall_like_events"], 2)
+        self.assertEqual(by_name["李四"]["recall_like_events"], 0)
+        self.assertEqual(leaders["recall_like_events"][0]["display_name"], "张三")
+
+    def test_member_payload_discovers_leader_fields_from_rows(self):
+        """榜单维度应自动跟随聚合列，不能在 server.py 里另维护一份清单。"""
+        from collections import Counter
+
+        from wechat_mcp.server import _member_payload
+
+        rows = [
+            {"u": "wxid_a", "name": "甲", "messages": 3, "chars": 10, "first_time": 100},
+            {"u": "wxid_b", "name": "乙", "messages": 1, "chars": 99, "first_time": 50},
+        ]
+        _, leaders = _member_payload(rows, 10, quoted=Counter())
+        # 数值列自动成为榜单维度
+        self.assertIn("messages", leaders)
+        self.assertIn("chars", leaders)
+        self.assertEqual(leaders["chars"][0]["display_name"], "乙")
+        # 首次发言时间戳语义不同，不参与榜单
+        self.assertNotIn("first_time", leaders)
+
+        # 调用方可以只订阅部分维度
+        _, subset = _member_payload(rows, 10, leader_fields=["messages"])
+        self.assertEqual(list(subset), ["messages"])
+
+
 if __name__ == "__main__":
     unittest.main()
